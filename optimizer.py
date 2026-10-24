@@ -50,7 +50,7 @@ from PyQt5.QtWidgets import (
 )
 
 
-VERSION = "v1.5.0"
+VERSION = "v1.5.1"
 APP_TITLE = "PZ Optimizer"
 PAGE_TITLE = "프로젝트 좀보이드 최적화 툴"
 
@@ -1281,6 +1281,7 @@ QCheckBox::indicator:disabled { border:1px solid #3a3c42; background:#1b1d22; }
 QPushButton#zb { background:#2b2e36; border:1px solid #1d9e75; color:#5dcaa5; font-weight:bold; padding:7px 14px; }
 QPushButton#zb:hover { background:#343843; }
 QPushButton#zb:disabled { border:1px solid rgba(255,255,255,0.12); color:#5f5e5a; }
+QPushButton#adv:checked { border:1px solid #ef9f27; color:#ef9f27; }
 QLabel#sect  { font-size:15px; font-weight:bold; color:#e8e8ea; }
 QLabel#linkok { color:#5dcaa5; font-weight:bold; }
 QLabel#err   { font-size:13px; font-weight:bold; color:#e24b4a; }
@@ -1712,6 +1713,7 @@ class OptimizerWindow(QWidget):
         self.rows = {}                 # key -> 항목 묶음 위젯 (빌드에 따라 표시/숨김)
         self.worker = None
         self._pending_update = None    # 적용 작업 중에 새 버전이 확인되면 끝난 뒤 띄운다
+        self._advanced = False         # [고급] 토글 — 켜야 PZ OP 박스가 보인다 (실행할 때마다 꺼진 채 시작)
         self._build()
         self.setStyleSheet(DARK_QSS)
         self._set_expanded(False)
@@ -1871,6 +1873,12 @@ class OptimizerWindow(QWidget):
         root.addWidget(self.prog_text); root.addWidget(self.prog)
 
         brow = QHBoxLayout(); brow.addStretch(1)
+        # PZ OP 는 바닐라 클래스를 대량 교체해 다른 모드와 충돌이 잦아 기본으로 숨긴다
+        self.adv_btn = QPushButton("고급"); self.adv_btn.setObjectName("adv")
+        self.adv_btn.setCheckable(True)
+        self.adv_btn.setToolTip("다른 모드와 충돌할 수 있는 항목(PZ OP)을 표시합니다.")
+        self.adv_btn.toggled.connect(self._set_advanced)
+        brow.addWidget(self.adv_btn)
         self.close_btn = QPushButton("닫기"); self.close_btn.clicked.connect(self.close)
         brow.addWidget(self.close_btn)
         root.addLayout(brow)
@@ -1979,8 +1987,13 @@ class OptimizerWindow(QWidget):
                                and not (st.get("pending") and state != "applied"))
 
     # --- PZ_Optimization ---
+    def _set_advanced(self, on):
+        self._advanced = on
+        gd = self.game_dir
+        self._po_refresh(gd if gd is not None and is_pz_dir(gd) else None)
+
     def _po_refresh(self, gd):
-        show = gd is not None and detect_build(Path(gd)) == "b42"
+        show = self._advanced and gd is not None and detect_build(Path(gd)) == "b42"
         self.po_box.setVisible(show)
         if not show:
             return
