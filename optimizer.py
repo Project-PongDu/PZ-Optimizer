@@ -50,7 +50,7 @@ from PyQt5.QtWidgets import (
 )
 
 
-VERSION = "v1.3.1"
+VERSION = "v1.4.0"
 APP_TITLE = "PZ Optimizer"
 PAGE_TITLE = "프로젝트 좀보이드 최적화 툴"
 
@@ -509,6 +509,11 @@ def opt_group_available(g, game_dir):
     """이 항목을 이 설치 폴더에 적용할 수 있는지. 반환: (가능여부, 불가사유)"""
     if game_dir is None:
         return False, "PZ 설치 폴더 없음"
+    # 빌드가 다른 항목은 파일이 우연히 존재해도 적용 불가. 예: B42 용 PZ_Optimization 모드는
+    # zombie/iso/IsoWorld.class 등을 게임 폴더에 풀어 넣는데, 여기에 B41 패치본을 덮으면 게임이 깨진다.
+    build = detect_build(Path(game_dir))
+    if build is not None and build not in g.builds:
+        return False, "이 빌드엔 해당 없음"
     if g.kind == "class":
         conf = opt_conf_dir()
         if conf is None:
@@ -1154,7 +1159,8 @@ def zb_status(game_dir):
         state = "outdated"
     if mod is None and state == "none":
         state = "nomod"
-    return {"state": state, "parts": parts, "spec": spec, "mod": mod, "steam_ok": steam_ok}
+    pending = workshop_item_state(ZB_WORKSHOP_ID)["pending"]
+    return {"state": state, "parts": parts, "spec": spec, "mod": mod, "steam_ok": steam_ok, "pending": pending}
 
 
 def zb_apply(game_dir):
@@ -1164,6 +1170,9 @@ def zb_apply(game_dir):
     if mod is None:
         raise RuntimeError("ZombieBuddy 모드를 찾을 수 없음 — 스팀 창작마당에서 ZombieBuddy 를 구독해 주세요\n"
                            "https://steamcommunity.com/sharedfiles/filedetails/?id=" + ZB_WORKSHOP_ID)
+    if workshop_item_state(ZB_WORKSHOP_ID)["pending"]:
+        raise RuntimeError("Steam 이 ZombieBuddy 업데이트를 받는 중입니다 — 다운로드가 끝난 뒤 다시 시도해 주세요.\n"
+                           "(받는 도중의 ZombieBuddy.jar 를 복사하면 게임이 켜지지 않을 수 있습니다)")
     spec = zb_spec(mod)
     arg = spec["launch_arg"]
     use_steam = is_steam_install(gd) and bool(_steam_localconfigs())
@@ -1281,6 +1290,210 @@ QProgressBar::chunk { background:#1d9e75; border-radius:4px; }
 """
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PZ_Optimization (xD3I, 창작마당 3805285544) 설치·업데이트·제거 — B42 전용
+#
+#  이 모드는 '구독만으로 안 되는' 수동 설치 모드다: 엔진 class ~1100개를 게임 폴더에 풀어 넣는다.
+#  설치·제거 로직은 우리가 다시 짜지 않고, 모드에 같이 들어 있는 제작자의 install.ps1 을 그대로 실행한다
+#      설치/업데이트 : install.ps1 -Dir <게임> -From <워크샵 pzopt-classes>   (네트워크 안 씀)
+#      제거          : install.ps1 -Uninstall -Dir <게임>
+#  → 제작자가 설치 방식을 바꿔도 Steam 이 받아온 새 install.ps1 이 쓰이므로 따라갈 필요가 없다.
+#
+#  최신 여부 판정 (로컬만 — 네트워크 안 씀)
+#    · 게임 폴더의 pzopt/build-info.properties(설치본) 와 워크샵 사본의 commit·built 비교
+#      → 다르면 '업데이트 필요'. 창작마당의 새 버전은 Steam 이 워크샵 폴더로 받아온 뒤에 반영된다.
+#    · Steam 이 받는 중(appworkshop_108600.acf 의 manifest ≠ latest_manifest)이면 설치·업데이트를 막는다.
+#    · 게임 리비전: 이 모드는 특정 게임 빌드(리비전) 전용이다. 워크샵 사본의 revision 이 게임 jar 의
+#            zombie/GitVersion 리비전과 다르면 설치하지 않는다 (제작자 스크립트도 거부한다).
+# ═══════════════════════════════════════════════════════════════════════════════
+PZOPT_WORKSHOP_ID = "3805285544"
+PZOPT_PAGE = "https://steamcommunity.com/sharedfiles/filedetails/?id=" + PZOPT_WORKSHOP_ID
+
+
+def read_props(p: Path) -> dict:
+    out = {}
+    try:
+        for ln in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            if ln.startswith("#") or "=" not in ln:
+                continue
+            k, v = ln.split("=", 1)
+            out[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
+def jar_revision(game_dir: Path):
+    """게임 jar 의 zombie/GitVersion 리비전 (10자리 hex). 못 읽으면 None."""
+    try:
+        with zipfile.ZipFile(game_dir / "projectzomboid.jar") as z:
+            data = z.read("zombie/GitVersion.class")
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return None
+    m = re.search(rb"\b[0-9a-f]{10}\b", data)
+    return m.group(0).decode() if m else None
+
+
+def pzopt_mod_root():
+    for root in _steam_roots():
+        for lib in _libraries_from(root):
+            d = lib / "steamapps" / "workshop" / "content" / PZ_APPID / PZOPT_WORKSHOP_ID / "mods" / "PZ_Optimization"
+            if d.is_dir():
+                return d
+    return None
+
+
+def pzopt_copies():
+    """워크샵 안의 빌드들: [(pzopt-classes 폴더, build-info dict)] — built 내림차순."""
+    root = pzopt_mod_root()
+    out = []
+    if root is None:
+        return out
+    for v in root.iterdir():
+        c = v / "pzopt-classes"
+        info = c / "pzopt" / "build-info.properties"
+        if info.is_file() and (c / "pzopt-files.txt").is_file() and (v / "install.ps1").is_file():
+            out.append((c, read_props(info)))
+    out.sort(key=lambda x: int(x[1].get("built", "0") or 0), reverse=True)
+    return out
+
+
+def workshop_item_state(item_id):
+    """appworkshop_108600.acf 에서 아이템의 다운로드 상태.
+       {"installed_time", "latest_time", "pending"} — pending=True 면 Steam 이 새 버전을 받는 중(또는 받을 예정).
+         WorkshopItemsInstalled.<id>  : 지금 디스크에 있는 버전 (timeupdated, manifest)
+         WorkshopItemDetails.<id>     : Steam 이 아는 최신 버전 (latest_timeupdated, latest_manifest)
+       설치본 manifest 와 latest_manifest 가 다르면 파일이 아직 덜 바뀐 상태라 그 폴더를 쓰면 안 된다."""
+    out = {"installed_time": 0, "latest_time": 0, "pending": False}
+    for root in _steam_roots():
+        for lib in _libraries_from(root):
+            acf = lib / "steamapps" / "workshop" / f"appworkshop_{PZ_APPID}.acf"
+            if not acf.is_file():
+                continue
+            try:
+                tree = _vdf_parse(acf.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                continue
+            inst = _vdf_find(tree, "AppWorkshop", "WorkshopItemsInstalled", item_id)
+            det = _vdf_find(tree, "AppWorkshop", "WorkshopItemDetails", item_id)
+            if inst is None and det is None:
+                continue
+
+            def vals(node):
+                return {c["key"].lower(): c["value"] for c in (node or {}).get("children", []) if "value" in c}
+
+            vi, vd = vals(inst), vals(det)
+
+            def num(v):
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    return 0
+
+            out["installed_time"] = num(vi.get("timeupdated"))
+            out["latest_time"] = max(num(vd.get("latest_timeupdated")), num(vd.get("timeupdated")))
+            lm, im = vd.get("latest_manifest"), vi.get("manifest")
+            out["pending"] = bool((lm and im and lm != im)
+                                  or out["latest_time"] > out["installed_time"] > 0
+                                  or (inst is None and det is not None))
+            return out
+    return out
+
+
+def pzopt_status(game_dir):
+    """dict: state, installed(props), best(copy, props) 등.
+       state: nomod | mismatch | none | installed | outdated | unfinished"""
+    gd = Path(game_dir)
+    rev = jar_revision(gd)
+    copies = pzopt_copies()
+    match = next(((c, p) for c, p in copies if p.get("revision") == rev), None)
+    manifest = gd / "pzopt-installed.txt"
+    inst = read_props(gd / "pzopt" / "build-info.properties") if manifest.is_file() else {}
+    unfinished = False
+    if manifest.is_file():
+        try:
+            unfinished = "# unfinished" in manifest.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+    if not copies:
+        state = "nomod" if not manifest.is_file() else "installed"
+    elif manifest.is_file():
+        if unfinished:
+            state = "unfinished"
+        elif match and (inst.get("commit") != match[1].get("commit") or inst.get("built") != match[1].get("built")):
+            state = "outdated"
+        elif inst.get("revision") and inst.get("revision") != rev:
+            state = "outdated" if match else "mismatch"
+        else:
+            state = "installed"
+    else:
+        state = "none" if match else "mismatch"
+    ws = workshop_item_state(PZOPT_WORKSHOP_ID)
+    incomplete = bool(match) and not pzopt_copy_complete(match[0])
+    return {"state": state, "rev": rev, "installed": inst, "match": match, "copies": copies,
+            "ws": ws, "busy": ws["pending"] or incomplete}
+
+
+def pzopt_copy_complete(classes_dir: Path) -> bool:
+    """pzopt-files.txt 에 적힌 파일이 워크샵 사본에 전부 있는가 (제작자 스크립트의 Find-WorkshopCopy 와 같은 검사).
+       -From 으로 폴더를 직접 넘기면 스크립트가 이 검사를 건너뛰므로 우리가 먼저 한다."""
+    try:
+        rels = [ln.strip() for ln in (classes_dir / "pzopt-files.txt").read_text(
+            encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+    except OSError:
+        return False
+    return all((classes_dir / r).is_file() for r in rels)
+
+
+def run_pzopt_script(game_dir, uninstall=False):
+    """제작자의 install.ps1 실행. 반환: (성공 여부, 출력 텍스트)."""
+    if os.name != "nt":
+        raise RuntimeError("PZ_Optimization 설치 스크립트는 Windows 에서만 실행합니다.")
+    st = pzopt_status(game_dir)
+    if uninstall:
+        script = None
+        # 설치 때 게임 폴더에 남는 사본을 우선 — 설치된 빌드와 짝이 맞고, Steam 이 워크샵 폴더를 받는 중이어도 온전하다
+        bundled = Path(game_dir) / "pzopt" / "uninstall" / "install.ps1"
+        if bundled.is_file():
+            script = bundled
+        elif st["copies"] and not st["ws"]["pending"]:
+            script = st["copies"][0][0].parent / "install.ps1"
+        if script is None:
+            raise RuntimeError("제거 스크립트를 찾을 수 없음 — 게임 폴더의 Uninstall-PZ-Optimization.cmd 를 실행해 주세요.")
+        args = ["-Uninstall", "-Dir", str(game_dir)]
+    else:
+        if st["busy"]:
+            raise RuntimeError("Steam 이 PZ_Optimization 업데이트를 받는 중입니다 — 다운로드가 끝난 뒤 다시 시도해 주세요.")
+        if st["match"] is None:
+            raise RuntimeError(f"이 게임 버전(리비전 {st['rev'] or '?'})용 PZ_Optimization 빌드가 워크샵 폴더에 없습니다.\n"
+                               "Steam 이 모드나 게임을 업데이트 중일 수 있습니다 — 잠시 뒤 다시 시도해 주세요.")
+        classes = st["match"][0]
+        script = classes.parent / "install.ps1"
+        args = ["-Dir", str(game_dir), "-From", str(classes)]
+    import subprocess
+    cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+           "-File", str(script)] + args
+    r = subprocess.run(cmd, capture_output=True, creationflags=0x08000000, timeout=900)
+    out = (r.stdout or b"").decode("utf-8", "replace") + (r.stderr or b"").decode("utf-8", "replace")
+    return r.returncode == 0, out.strip()
+
+
+class TaskWorker(QThread):
+    """임의 함수를 백그라운드에서 실행 (PowerShell 설치 스크립트 등)."""
+    done = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self):
+        try:
+            self.done.emit(self.fn())
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
 class ApplyWorker(QThread):
     """파일 작업은 백그라운드에서 (GraalVM 압축 해제가 수십 초 걸릴 수 있음)."""
     progress = pyqtSignal(str, int)
@@ -1390,6 +1603,19 @@ class OptimizerWindow(QWidget):
         zh.addWidget(self.zb_btn)
         root.addWidget(self.zb_box)
 
+        # PZ_Optimization (B42 전용 수동 설치 모드) 설치·업데이트·제거
+        self.po_box = QFrame(); self.po_box.setObjectName("box")
+        ph = QHBoxLayout(self.po_box); ph.setContentsMargins(12, 10, 12, 10); ph.setSpacing(10)
+        pv = QVBoxLayout(); pv.setSpacing(2)
+        self.po_state = self._lbl("", "zbstate")
+        self.po_detail = self._lbl("", "hint")
+        pv.addWidget(self.po_state); pv.addWidget(self.po_detail)
+        ph.addLayout(pv, 1)
+        self.po_btn = QPushButton("PZ_Optimization 설치"); self.po_btn.setObjectName("zb")
+        self.po_btn.clicked.connect(self._po_click)
+        ph.addWidget(self.po_btn)
+        root.addWidget(self.po_box)
+
         # 일반 최적화 — ZombieBuddy 박스와 같은 양식. 버튼으로 체크박스 목록을 펼치고 접는다.
         self.opt_box = QFrame(); self.opt_box.setObjectName("box")
         ov = QVBoxLayout(self.opt_box); ov.setContentsMargins(12, 10, 12, 10); ov.setSpacing(8)
@@ -1496,6 +1722,7 @@ class OptimizerWindow(QWidget):
         self.status.setText("\n".join(msgs))
         self.status.setVisible(bool(msgs))
         self._zb_refresh(gd if valid else None)
+        self._po_refresh(gd if valid else None)
 
         notes = []
         info = graal_zip_info()
@@ -1542,12 +1769,100 @@ class OptimizerWindow(QWidget):
         detail = []
         if not st["steam_ok"]:
             detail.append("Steam 정식 설치 폴더가 아니라 Steam 실행 옵션은 건드리지 않습니다 (json·bat 만 적용).")
+        if st.get("pending") and state != "applied":
+            detail.append("Steam 이 ZombieBuddy 업데이트를 받는 중입니다 — 끝나면 다시 열어 주세요.")
         if zb_installer_mismatch(spec):
             detail.append(f"⚠ ZombieBuddy 설치기가 v{spec['installer_version']} 로 바뀌었습니다 — "
                           "설치 방식이 달라졌을 수 있으니 PZ Optimizer 업데이트를 확인하세요.")
         self.zb_detail.setText("\n".join(detail))
         self.zb_detail.setVisible(bool(detail))
-        self.zb_btn.setEnabled(state != "nomod" or st["mod"] is not None)
+        # 받는 중엔 복사가 필요한 동작(적용·업데이트)만 막고, 해제는 허용 (워크샵 파일을 안 쓰므로)
+        self.zb_btn.setEnabled((state != "nomod" or st["mod"] is not None)
+                               and not (st.get("pending") and state != "applied"))
+
+    # --- PZ_Optimization ---
+    def _po_refresh(self, gd):
+        show = gd is not None and detect_build(Path(gd)) == "b42"
+        self.po_box.setVisible(show)
+        if not show:
+            return
+        st = pzopt_status(gd)
+        self._po_st = st
+        inst, match = st["installed"], st["match"]
+
+        def ver(p):
+            if not p:
+                return "?"
+            t = time.strftime("%Y-%m-%d", time.localtime(int(p.get("built", "0") or 0))) if p.get("built") else "?"
+            return f"{p.get('commit', '?')} ({t})"
+
+        state = st["state"]
+        detail = []
+        if state == "installed":
+            self.po_state.setText(f"PZ_Optimization 설치됨  ·  {ver(inst)}")
+            self.po_btn.setText("PZ_Optimization 제거")
+        elif state == "outdated":
+            self.po_state.setText(f"PZ_Optimization 업데이트 있음  ·  {ver(inst)} → {ver(match[1] if match else None)}")
+            self.po_btn.setText("PZ_Optimization 업데이트")
+        elif state == "unfinished":
+            self.po_state.setText("PZ_Optimization 설치가 중간에 멈춤")
+            self.po_btn.setText("PZ_Optimization 다시 설치")
+        elif state == "mismatch":
+            self.po_state.setText("PZ_Optimization — 이 게임 버전용 빌드 없음")
+            self.po_btn.setText("PZ_Optimization 제거" if inst else "PZ_Optimization 설치")
+            detail.append(f"게임 리비전 {st['rev'] or '?'} 용 빌드가 워크샵 폴더에 없습니다. "
+                          "모드 제작자가 새 게임 버전용 빌드를 올리고 Steam 이 받아오면 설치할 수 있습니다.")
+        elif state == "nomod":
+            self.po_state.setText("PZ_Optimization 모드를 구독하지 않음")
+            self.po_btn.setText("PZ_Optimization 설치")
+            detail.append("창작마당에서 PZ_Optimization 을 구독하면 여기서 설치할 수 있습니다.")
+        else:
+            self.po_state.setText(f"PZ_Optimization 미설치  ·  워크샵 {ver(match[1] if match else None)}")
+            self.po_btn.setText("PZ_Optimization 설치")
+        if state in ("installed", "outdated", "none", "unfinished"):
+            detail.append("힙·GC·JIT 를 바꾸는 이 모드의 게임 내 설정은 위 힙/GraalVM 항목과 겹칩니다 — 한쪽만 쓰세요.")
+        if st["busy"]:
+            detail.append("Steam 이 PZ_Optimization 업데이트를 받는 중입니다 — 끝나면 다시 열어 주세요.")
+        self.po_detail.setText("\n".join(detail))
+        self.po_detail.setVisible(bool(detail))
+        can = (state in ("installed", "outdated", "unfinished", "none")
+               or (state == "mismatch" and bool(inst)))
+        if st["busy"] and state in ("outdated", "unfinished", "none"):
+            can = False                                       # 받는 중인 파일로 설치하지 않는다
+        self.po_btn.setEnabled(can and self.worker is None)
+
+    def _po_click(self):
+        gd = self.game_dir
+        if gd is None or self.worker is not None:
+            return
+        if pz_running():
+            QMessageBox.information(self, APP_TITLE, "Project Zomboid가 실행 중입니다. 게임을 먼저 종료해 주세요.")
+            return
+        st = pzopt_status(gd)
+        uninstall = st["state"] == "installed" or (st["state"] == "mismatch" and st["installed"])
+        what = "제거" if uninstall else ("업데이트" if st["state"] == "outdated" else "설치")
+        if not uninstall and QMessageBox.question(
+                self, APP_TITLE,
+                "PZ_Optimization 은 게임 엔진 class 약 1,100개를 게임 폴더에 넣는 모드입니다.\n"
+                "제작자가 다른 모드·멀티플레이와의 호환을 보장하지 않습니다.\n\n"
+                f"{what}할까요? (모드에 포함된 제작자의 설치 스크립트를 실행합니다)") != QMessageBox.Yes:
+            return
+        self._set_busy(True)
+        self.prog.setRange(0, 0); self.prog_text.setText(f"PZ_Optimization {what} 중… (1분 정도 걸릴 수 있습니다)")
+        self.worker = TaskWorker(lambda: run_pzopt_script(gd, uninstall=uninstall))
+        self.worker.done.connect(lambda res: self._po_done(what, res))
+        self.worker.failed.connect(self._on_failed)
+        self.worker.start()
+
+    def _po_done(self, what, res):
+        ok, out = res
+        self.prog.setRange(0, 100)
+        self._finish()
+        tail = "\n".join(out.splitlines()[-12:])
+        if ok:
+            QMessageBox.information(self, APP_TITLE, f"PZ_Optimization {what} 완료\n\n{tail}")
+        else:
+            QMessageBox.warning(self, APP_TITLE, f"PZ_Optimization {what} 실패\n\n{tail}")
 
     def _zb_toggle(self):
         gd = self.game_dir
@@ -1590,7 +1905,8 @@ class OptimizerWindow(QWidget):
 
     # --- 적용 ---
     def _set_busy(self, busy):
-        for w in (self.apply_btn, self.close_btn, self.pick_btn, self.all_btn, self.none_btn, self.zb_btn):
+        for w in (self.apply_btn, self.close_btn, self.pick_btn, self.all_btn, self.none_btn, self.zb_btn,
+                  self.po_btn):
             w.setEnabled(not busy)
         for cb in self.boxes.values():
             cb.setAttribute(Qt.WA_TransparentForMouseEvents, busy)
@@ -1621,6 +1937,7 @@ class OptimizerWindow(QWidget):
         if self.worker is not None:
             self.worker.wait()
             self.worker = None
+        self.prog.setRange(0, 100)
         self._set_busy(False)
         self._reload_state()
         if self._pending_update is not None:
