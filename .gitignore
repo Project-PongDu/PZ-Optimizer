@@ -1,0 +1,12 @@
+/build
+*.spec
+
+# 빌드 산출물은 git 이 아니라 GitHub Releases 로 배포한다.
+/dist
+
+# Oracle GraalVM 원본 zip (약 350MB) — GitHub 는 100MB 넘는 파일을 거부한다.
+# 빌드할 때만 build.bat 옆에 두고, 어떤 버전을 썼는지는 README 에 버전·sha256 으로 남긴다.
+graalvm-jdk-*.zip
+
+__pycache__/
+*.pyc

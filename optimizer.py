@@ -1,0 +1,1058 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+optimizer.py  —  PZ Optimizer : Project Zomboid 설치 폴더 최적화 도구
+
+퐁듀 런처(gui.py)에 들어 있던 '게임 최적화' 기능을 별도 exe 로 분리한 것.
+런처는 방송마다 켜는 상시 프로그램이고 이쪽은 설치/패치 후 1회 실행하는 관리자 도구라,
+GraalVM(수백 MB)을 묶어도 런처 시작 속도·자동 업데이트 용량에 영향이 없다.
+
+항목 (체크 = 적용 / 해제 = 원본 복원, 자동 적용 없음)
+    chunk / world / netzombie / zcount : 좀비·청크 연산 패치 class 교체 (B41 전용)
+    heap   : JVM 힙 = 전체 RAM 의 절반 (ProjectZomboid64.json + .bat, B41·B42 공통)
+    graal  : jre64 → Oracle GraalVM 교체 + JVM 인자 2개 추가 (Java 25 = B42 전용)
+               -XX:+AlwaysPreTouch                        시작 시 힙 페이지를 미리 확보
+               -Djdk.graal.CompilerConfiguration=enterprise  Graal JIT 최적화 등급 고정
+
+백업 (게임 폴더 puppet_opt_backup/)
+    · class / json / bat : 최초 1회 복사 (원본 보존). json/bat 은 '원본 힙 값'을 읽는 기준으로만
+      쓰고, 복원은 인자 단위로 한다 — heap 과 graal 이 같은 json 을 건드리므로 파일째 덮으면
+      다른 항목의 인자까지 날아간다.
+    · jre64 : 복사하지 않고 puppet_opt_backup/jre64 로 '이름만 이동' (같은 드라이브라 즉시 끝남).
+    · pongdu_opt_state.json : 적용된 항목의 지문(class sha256, 힙 크기, GraalVM 버전·인자).
+      퐁듀 런처가 이 파일만 읽어서 'PZ 업데이트로 최적화가 풀렸는지'를 표시한다.
+
+빌드: build.bat (PyInstaller --onefile --uac-admin → 항상 관리자 권한으로 실행)
+"""
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import sys
+import time
+import zipfile
+from collections import namedtuple
+from pathlib import Path
+
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QIcon, QPixmap
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QLineEdit, QPushButton, QVBoxLayout, QHBoxLayout,
+    QFileDialog, QFrame, QCheckBox, QMessageBox, QScrollArea, QProgressBar,
+)
+
+
+VERSION = "v1.0.0"
+APP_TITLE = "PZ Optimizer"
+
+OPT_DIRNAME = "opt_conf"                        # 패치 class 묶음 (exe 에 --add-data 로 포함)
+GRAAL_ZIP_NAME = "graalvm-jdk-25_windows-x64_bin.zip"   # Oracle 공식 zip 원본 그대로 포함
+OPT_BACKUP_DIRNAME = "puppet_opt_backup"        # 런처 시절과 같은 이름 — 기존 백업 그대로 이어씀
+STATE_FILE = "pongdu_opt_state.json"            # 퐁듀 런처가 읽는 적용 상태 기록
+PZ_APPID = "108600"
+ICON_FILE = "pongdu.ico"
+
+GRAAL_VMARGS = ["-XX:+AlwaysPreTouch", "-Djdk.graal.CompilerConfiguration=enterprise"]
+JRE_TMP_DIRNAME = "jre64.__pzopt_tmp"           # 압축 해제 임시 폴더 (끝나면 jre64 로 이름 변경)
+DISK_MARGIN_MB = 512                            # 압축 해제 크기 외 여유 공간
+PRETOUCH_WARN_RAM_MB = 32 * 1024                # 이 미만이면 AlwaysPreTouch 경고 문구 표시
+
+
+def resource_path(rel):
+    """exe(PyInstaller)로 묶였을 때든 그냥 실행이든 리소스 파일 경로를 찾는다."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
+
+
+# ── 설정 (%APPDATA%\PZ-Optimizer\config.json) ────────────────────────────────
+# 퐁듀 런처도 이 파일의 pz_dir 을 읽어 '최적화 상태'를 표시할 폴더를 정한다.
+def config_path() -> Path:
+    base = os.environ.get("APPDATA") or str(Path.home())
+    return Path(base) / "PZ-Optimizer" / "config.json"
+
+
+def load_config() -> dict:
+    try:
+        d = json.loads(config_path().read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_config(cfg: dict):
+    try:
+        p = config_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+# ── 시스템 정보 ───────────────────────────────────────────────────────────────
+def total_ram_mb() -> int:
+    """전체 물리 RAM (MB). Windows는 GlobalMemoryStatusEx, 개발용(posix)은 sysconf."""
+    if os.name == "nt":
+        import ctypes
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+        st = MEMORYSTATUSEX()
+        st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return int(st.ullTotalPhys // (1024 * 1024))
+        return 0
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // (1024 * 1024))
+    except (ValueError, OSError, AttributeError):
+        return 0
+
+
+def half_ram_mb() -> int:
+    """할당할 힙 크기 = 전체 RAM의 절반 (256MB 단위 절사, 최소 2048)."""
+    total = total_ram_mb()
+    if total <= 0:
+        return 0
+    return max(2048, (total // 2 // 256) * 256)
+
+
+def is_admin() -> bool:
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def pz_running() -> bool:
+    """실제 프로세스 목록으로 PZ 실행 여부 확인 (실행 중이면 jvm.dll·class 가 잠겨 교체 불가)."""
+    KEY = "projectzomboid"
+    try:                                         # psutil 있으면 우선 (의존성 아님)
+        import psutil  # pyright: ignore[reportMissingModuleSource]
+        for p in psutil.process_iter(["name"]):
+            if KEY in (p.info.get("name") or "").lower():
+                return True
+        return False
+    except Exception:
+        pass
+    import subprocess
+    if os.name == "nt":
+        try:
+            CREATE_NO_WINDOW = 0x08000000        # noconsole exe 에서 콘솔창 안 뜨게
+            out = subprocess.run(["tasklist"], capture_output=True, text=True,
+                                 creationflags=CREATE_NO_WINDOW).stdout.lower()
+            return KEY in out
+        except Exception:
+            return False
+    try:                                         # 개발용 폴백 (mac/linux)
+        out = subprocess.run(["pgrep", "-fil", KEY], capture_output=True, text=True).stdout.lower()
+        return KEY in out
+    except Exception:
+        return False
+
+
+# ── PZ 설치 폴더 탐색 ─────────────────────────────────────────────────────────
+def _steam_roots():
+    """Steam 루트 후보들: 레지스트리(HKCU 우선) → 드라이브 스캔. 중복 제거."""
+    roots = []
+    if os.name == "nt":
+        try:
+            import winreg
+            for hive, key, val in (
+                (winreg.HKEY_CURRENT_USER,  r"Software\Valve\Steam",              "SteamPath"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam",  "InstallPath"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam",              "InstallPath"),
+            ):
+                try:
+                    with winreg.OpenKey(hive, key) as k:
+                        v, _ = winreg.QueryValueEx(k, val)
+                    p = Path(str(v))
+                    if p.exists():
+                        roots.append(p)
+                except OSError:
+                    pass
+        except ImportError:
+            pass
+    for drive in ("C:", "D:", "E:", "F:", "G:", "H:"):
+        for sub in ("Steam", "SteamLibrary",
+                    "Program Files (x86)\\Steam", "Program Files\\Steam"):
+            p = Path(drive + "\\") / sub
+            if p.exists():
+                roots.append(p)
+    seen, out = set(), []
+    for r in roots:
+        key = str(r).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+
+_VDF_PATH_RE = re.compile(r'"path"\s+"((?:[^"\\]|\\.)*)"')
+
+
+def _libraries_from(steam_root: Path):
+    """steamapps/libraryfolders.vdf 파싱 → 이 Steam이 아는 모든 라이브러리 폴더."""
+    libs = [steam_root]
+    vdf = steam_root / "steamapps" / "libraryfolders.vdf"
+    try:
+        raw = vdf.read_text(encoding="utf-8", errors="replace")
+        for m in _VDF_PATH_RE.finditer(raw):
+            libs.append(Path(m.group(1).replace("\\\\", "\\")))
+    except OSError:
+        pass
+    return libs
+
+
+def find_pz_dir():
+    """PZ 설치 폴더 탐색. appmanifest_108600.acf가 있는 라이브러리 우선(별도 SteamLibrary 지원),
+       없으면 폴더 존재만으로 폴백. 못 찾으면 None."""
+    roots = _steam_roots()
+    for root in roots:
+        for lib in _libraries_from(root):
+            steamapps = lib / "steamapps"
+            if (steamapps / f"appmanifest_{PZ_APPID}.acf").exists():
+                g = steamapps / "common" / "ProjectZomboid"
+                if g.exists():
+                    return g
+    for root in roots:
+        g = root / "steamapps" / "common" / "ProjectZomboid"
+        if g.exists():
+            return g
+    return None
+
+
+def is_pz_dir(p) -> bool:
+    """최소 조건: ProjectZomboid64.json 이 있어야 우리가 아는 PZ 설치 폴더."""
+    try:
+        return p is not None and (Path(p) / "ProjectZomboid64.json").exists()
+    except OSError:
+        return False
+
+
+def initial_game_dir():
+    """마지막으로 고른 폴더 우선, 없으면 자동 탐색."""
+    saved = load_config().get("pz_dir", "")
+    if saved and is_pz_dir(saved):
+        return Path(saved)
+    return find_pz_dir()
+
+
+# ── JRE 판별 (jre64/release) ──────────────────────────────────────────────────
+def parse_release(text: str) -> dict:
+    out = {}
+    for line in text.splitlines():
+        k, sep, v = line.partition("=")
+        if sep:
+            out[k.strip()] = v.strip().strip('"')
+    return out
+
+
+def read_release(jre_dir: Path) -> dict:
+    try:
+        return parse_release((jre_dir / "release").read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return {}
+
+
+def java_major(rel: dict) -> int:
+    m = re.match(r"(\d+)", rel.get("JAVA_VERSION", ""))
+    return int(m.group(1)) if m else 0
+
+
+def is_graal_release(rel: dict) -> bool:
+    return bool(rel.get("GRAALVM_VERSION"))
+
+
+def jre_state(game_dir: Path) -> str:
+    """'graal' | 'vanilla' | 'mixed' | 'missing'
+       mixed = Steam 무결성 검사/업데이트가 Graal 위에 원본 파일을 덮어써서 섞인 상태.
+               release 는 원본으로 돌아왔는데 Graal 전용 파일이 남아 있으면 이걸로 본다."""
+    j = game_dir / "jre64"
+    if not j.is_dir():
+        return "missing"
+    if is_graal_release(read_release(j)):
+        return "graal"
+    if (j / "GRAALVM-README.md").exists() or (j / "bin" / "jvmcicompiler.dll").exists():
+        return "mixed"
+    return "vanilla"
+
+
+def vanilla_release(game_dir: Path) -> dict:
+    """게임 원래 JRE 의 release. jre64 가 Graal 이거나 섞였으면 백업본을 본다."""
+    if jre_state(game_dir) == "vanilla":
+        return read_release(game_dir / "jre64")
+    bk = read_release(game_dir / OPT_BACKUP_DIRNAME / "jre64")
+    return bk or read_release(game_dir / "jre64")
+
+
+def build_label(game_dir: Path) -> str:
+    rel = vanilla_release(game_dir)
+    major = java_major(rel)
+    name = {17: "B41", 25: "B42"}.get(major, "알 수 없는 빌드")
+    jre = {"graal": "GraalVM " + read_release(game_dir / "jre64").get("GRAALVM_VERSION", ""),
+           "vanilla": "원본", "mixed": "섞임 (재적용 필요)", "missing": "없음"}[jre_state(game_dir)]
+    return f"감지된 빌드: {name} (Java {major or '?'})  ·  현재 JRE: {jre}"
+
+
+# ── 번들된 GraalVM zip ────────────────────────────────────────────────────────
+_GRAAL_INFO = None
+
+
+def graal_zip_path():
+    p = Path(resource_path(GRAAL_ZIP_NAME))
+    return p if p.is_file() else None
+
+
+def graal_zip_info():
+    """(최상위 폴더명, release dict, 압축 해제 크기 bytes) | None. 결과는 캐시."""
+    global _GRAAL_INFO
+    if _GRAAL_INFO is not None:
+        return _GRAAL_INFO or None
+    _GRAAL_INFO = ()
+    zp = graal_zip_path()
+    if zp is None:
+        return None
+    try:
+        with zipfile.ZipFile(zp) as z:
+            infos = z.infolist()
+            tops = {i.filename.split("/", 1)[0] for i in infos}
+            if len(tops) != 1:
+                return None
+            top = tops.pop()
+            rel = parse_release(z.read(f"{top}/release").decode("utf-8", "replace"))
+            size = sum(i.file_size for i in infos)
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return None
+    if not is_graal_release(rel):
+        return None
+    _GRAAL_INFO = (top, rel, size)
+    return _GRAAL_INFO
+
+
+# ── 항목 정의 ─────────────────────────────────────────────────────────────────
+# key   : 설정/상태 기록용 식별자
+# kind  : "class" = opt_conf 패치본으로 교체 / "heap" = 힙 인자 치환 / "graal" = JRE 교체 + 인자
+# label : 체크박스 표시명
+# files : 게임 폴더 기준 상대경로. class/heap 은 백업 대상이기도 하다 (그룹 내 전부 함께 움직임).
+#         IsoWorld$* 는 IsoWorld 내부 클래스라 버전이 서로 맞아야 해서 한 그룹으로 묶는다.
+OptGroup = namedtuple("OptGroup", "key kind label files")
+
+OPT_GROUPS = [
+    OptGroup("chunk", "class", "청크 로딩 최적화  [B41]",
+             ["zombie/iso/IsoChunkMap.class"]),
+    OptGroup("world", "class", "월드 업데이트 / 좀비 정렬 연산 최적화  [B41]",
+             ["zombie/iso/IsoWorld.class",
+              "zombie/iso/IsoWorld$CompDistToPlayer.class",
+              "zombie/iso/IsoWorld$CompScoreToPlayer.class",
+              "zombie/iso/IsoWorld$Frame.class",
+              "zombie/iso/IsoWorld$MetaCell.class",
+              "zombie/iso/IsoWorld$s_performance.class"]),
+    OptGroup("netzombie", "class", "좀비 네트워크 패킷 최적화  [B41]",
+             ["zombie/popman/NetworkZombiePacker.class"]),
+    OptGroup("zcount", "class", "좀비 개체수 연산 최적화  [B41]",
+             ["zombie/popman/ZombieCountOptimiser.class"]),
+    OptGroup("heap", "heap", "JVM 힙 메모리 = 전체 RAM 의 절반  [B41·B42]",
+             ["ProjectZomboid64.json", "ProjectZomboid64.bat"]),
+    OptGroup("graal", "graal", "JVM 교체: Oracle GraalVM + AlwaysPreTouch  [B42]",
+             ["jre64/  →  Oracle GraalVM (원본은 puppet_opt_backup/jre64 로 이동)",
+              "ProjectZomboid64.json / .bat  +  " + "  ".join(GRAAL_VMARGS)]),
+]
+OPT_GROUP_BY_KEY = {g.key: g for g in OPT_GROUPS}
+
+_XMX_RE = re.compile(r"-Xmx\d+[mMgG]")
+_XMS_RE = re.compile(r"-Xms\d+[mMgG]")
+_BAT_JAVA_RE = re.compile(r'(jre64\\bin\\java\.exe")', re.I)
+
+
+def opt_conf_dir():
+    """패치 리소스 폴더(opt_conf). 빌드에 안 들어갔으면 None → class 항목 비활성."""
+    p = Path(resource_path(OPT_DIRNAME))
+    return p if p.is_dir() else None
+
+
+# ── 파일 헬퍼 ─────────────────────────────────────────────────────────────────
+def _backup_once(game_dir: Path, rel):
+    """원본을 puppet_opt_backup/에 백업. 이미 백업본이 있으면 건드리지 않음(최초 원본 보존)."""
+    src = game_dir / rel
+    dst = game_dir / OPT_BACKUP_DIRNAME / rel
+    if src.exists() and not dst.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+
+def _rmtree(p: Path):
+    """읽기 전용 속성 파일까지 지우는 rmtree."""
+    def _force(func, path, _exc):
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(p, onexc=_force)
+    else:
+        shutil.rmtree(p, onerror=_force)
+
+
+def _sha256(p: Path) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _load_json(p: Path):
+    """(data, indent). 원본 들여쓰기(탭/공백)를 유지해 다시 쓰기 위함."""
+    raw = p.read_text(encoding="utf-8")
+    return json.loads(raw), ("\t" if "\n\t" in raw else 2)
+
+
+def _save_json(p: Path, data, indent):
+    p.write_text(json.dumps(data, indent=indent, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def _json_vmargs(game_dir: Path):
+    try:
+        data, _ = _load_json(game_dir / "ProjectZomboid64.json")
+        return [str(a) for a in data.get("vmArgs", [])]
+    except Exception:
+        return []
+
+
+def _json_heap_mb(game_dir) -> int:
+    """ProjectZomboid64.json 의 -Xmx 값(MB). 못 읽으면 0."""
+    for a in _json_vmargs(game_dir):
+        m = re.match(r"-Xmx(\d+)m$", a, re.I)
+        if m:
+            return int(m.group(1))
+    return 0
+
+
+def _is_heap_arg(a) -> bool:
+    return str(a).startswith("-Xms") or str(a).startswith("-Xmx")
+
+
+def _replace_heap_args(args, new):
+    """기존 -Xms/-Xmx 자리에 new 를 끼워 넣는다 (없으면 맨 앞). 다른 인자·순서는 그대로 →
+       적용 후 복원하면 원본 json 과 순서까지 같아진다."""
+    idx = next((i for i, a in enumerate(args) if _is_heap_arg(a)), 0)
+    rest = [a for a in args if not _is_heap_arg(a)]
+    idx = min(idx, len(rest))
+    return rest[:idx] + list(new) + rest[idx:]
+
+
+def _edit_json_vmargs(game_dir: Path, fn):
+    """vmArgs 를 fn(list)->list 로 바꿔 저장 (나머지 키·들여쓰기 보존)."""
+    p = game_dir / "ProjectZomboid64.json"
+    data, indent = _load_json(p)
+    data["vmArgs"] = fn([a for a in data.get("vmArgs", [])])
+    _save_json(p, data, indent)
+
+
+def _bat_java_lines(raw: str):
+    return [ln for ln in raw.splitlines() if _BAT_JAVA_RE.search(ln)]
+
+
+def _bat_add_args(raw: str, args) -> str:
+    out = []
+    for ln in raw.splitlines(keepends=True):
+        if _BAT_JAVA_RE.search(ln):
+            missing = [a for a in args if a not in ln.split()]
+            if missing:
+                ln = _BAT_JAVA_RE.sub(lambda m: m.group(1) + " " + " ".join(missing), ln, count=1)
+        out.append(ln)
+    return "".join(out)
+
+
+def _bat_remove_args(raw: str, args) -> str:
+    for a in args:
+        raw = re.sub(r"[ \t]+" + re.escape(a) + r"(?=[ \t\r\n])", "", raw)
+    return raw
+
+
+# ── 항목 단위 조회/적용/해제 ──────────────────────────────────────────────────
+def opt_group_available(g, game_dir):
+    """이 항목을 이 설치 폴더에 적용할 수 있는지. 반환: (가능여부, 불가사유)"""
+    if game_dir is None:
+        return False, "PZ 설치 폴더 없음"
+    if g.kind == "class":
+        conf = opt_conf_dir()
+        if conf is None:
+            return False, "패치 리소스(opt_conf) 없음"
+        for rel in g.files:
+            fname = rel.rsplit("/", 1)[-1]
+            if not (conf / fname).exists():
+                return False, f"패치 파일 누락: {fname}"
+            # 패치본이 이미 덮여 있어도 파일 자체는 존재해야 한다. 없으면 구조가 다른 빌드(B42 등).
+            if not (game_dir / rel).exists():
+                return False, "이 설치본엔 해당 없음"
+        return True, ""
+    if not (game_dir / "ProjectZomboid64.json").exists():
+        return False, "ProjectZomboid64.json 없음"
+    if g.kind == "heap":
+        if half_ram_mb() <= 0:
+            return False, "RAM 크기를 알 수 없음"
+        return True, ""
+    # graal
+    info = graal_zip_info()
+    if info is None:
+        return False, "GraalVM zip 이 빌드에 포함되지 않음"
+    want = java_major(info[1])
+    have = java_major(vanilla_release(game_dir))
+    if have != want:
+        return False, f"Java {want} 빌드(B42) 전용 — 이 설치본은 Java {have or '?'}"
+    return True, ""
+
+
+def _graal_vmargs_ok(game_dir) -> bool:
+    args = _json_vmargs(game_dir)
+    if not all(a in args for a in GRAAL_VMARGS):
+        return False
+    bpath = game_dir / "ProjectZomboid64.bat"
+    if bpath.exists():
+        try:
+            raw = bpath.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        for ln in _bat_java_lines(raw):
+            if not all(a in ln.split() for a in GRAAL_VMARGS):
+                return False
+    return True
+
+
+def opt_group_applied(g, game_dir) -> bool:
+    """이 항목이 현재 '완전히 패치된 상태'인지. 부분 적용은 False (적용 누르면 다시 맞춰진다)."""
+    if game_dir is None:
+        return False
+    if g.kind == "class":
+        conf = opt_conf_dir()
+        if conf is None:
+            return False
+        for rel in g.files:
+            fname = rel.rsplit("/", 1)[-1]
+            src, dst = conf / fname, game_dir / rel
+            try:
+                if not dst.exists() or dst.read_bytes() != src.read_bytes():
+                    return False
+            except OSError:
+                return False
+        return True
+    if g.kind == "heap":
+        mb = half_ram_mb()
+        if mb <= 0 or _json_heap_mb(game_dir) != mb:
+            return False
+        bpath = game_dir / "ProjectZomboid64.bat"
+        if bpath.exists():
+            try:
+                raw = bpath.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return False
+            # bat 안의 -Xmx 는 여러 줄에 나온다. 하나라도 다른 값이면 미적용으로 본다
+            found = _XMX_RE.findall(raw)
+            if not found or any(x.lower() != f"-xmx{mb}m" for x in found):
+                return False
+        return True
+    # graal
+    info = graal_zip_info()
+    if info is None or jre_state(game_dir) != "graal":
+        return False
+    cur = read_release(game_dir / "jre64").get("GRAALVM_VERSION")
+    return cur == info[1].get("GRAALVM_VERSION") and _graal_vmargs_ok(game_dir)
+
+
+def opt_group_touched(g, game_dir) -> bool:
+    """원본에서 조금이라도 바뀌어 있는가 (해제 시 복원 대상 판정용).
+       graal 은 JRE 만 바뀌고 인자는 없는 식의 반쪽 상태가 있을 수 있어 따로 본다."""
+    if g.kind != "graal":
+        return opt_group_applied(g, game_dir)
+    if jre_state(game_dir) in ("graal", "mixed"):
+        return True
+    args = _json_vmargs(game_dir)
+    return any(a in args for a in GRAAL_VMARGS)
+
+
+def _apply_heap(game_dir: Path):
+    mb = half_ram_mb()
+    for rel in OPT_GROUP_BY_KEY["heap"].files:
+        _backup_once(game_dir, Path(rel))     # 원본 힙 값을 기억하는 기준본
+    _edit_json_vmargs(game_dir, lambda a: _replace_heap_args(a, [f"-Xms{mb}m", f"-Xmx{mb}m"]))
+    # bat (직접 실행용): 바닐라 bat 는 java 실행 라인이 2개(-Xmx 고정)라 전부 치환해야 한다.
+    bpath = game_dir / "ProjectZomboid64.bat"
+    if bpath.exists():
+        raw = bpath.read_text(encoding="utf-8", errors="replace")
+        raw = _XMX_RE.sub(f"-Xmx{mb}m", raw)
+        raw = _XMS_RE.sub(f"-Xms{mb}m", raw)
+        bpath.write_text(raw, encoding="utf-8")
+
+
+def _restore_heap(game_dir: Path):
+    """백업 원본에서 힙 인자만 읽어와 되돌린다 (graal 인자 등 다른 인자는 보존)."""
+    bdir = game_dir / OPT_BACKUP_DIRNAME
+    bjson = bdir / "ProjectZomboid64.json"
+    if not bjson.exists():
+        raise RuntimeError("힙 설정 백업이 없음 — Steam '게임 파일 무결성 검사'로 복원해 주세요")
+    bdata, _ = _load_json(bjson)
+    orig = [a for a in bdata.get("vmArgs", []) if _is_heap_arg(a)]
+    _edit_json_vmargs(game_dir, lambda a: _replace_heap_args(a, orig))
+    bpath, bbat = game_dir / "ProjectZomboid64.bat", bdir / "ProjectZomboid64.bat"
+    if bpath.exists() and bbat.exists():
+        raw = bpath.read_text(encoding="utf-8", errors="replace")
+        braw = bbat.read_text(encoding="utf-8", errors="replace")
+        bx, bs = _XMX_RE.search(braw), _XMS_RE.search(braw)
+        if bx:
+            raw = _XMX_RE.sub(bx.group(0), raw)
+        raw = _XMS_RE.sub(bs.group(0), raw) if bs else re.sub(r"[ \t]+-Xms\d+[mMgG]", "", raw)
+        bpath.write_text(raw, encoding="utf-8")
+
+
+def _extract_graal(game_dir: Path, progress):
+    """번들 zip → game_dir/jre64.__pzopt_tmp (최상위 폴더 한 단계 벗겨서). 반환: 임시 폴더."""
+    top, _rel, size = graal_zip_info()
+    tmp = game_dir / JRE_TMP_DIRNAME
+    if tmp.exists():
+        _rmtree(tmp)
+    need = size + DISK_MARGIN_MB * 1024 * 1024
+    free = shutil.disk_usage(game_dir).free
+    if free < need:
+        raise RuntimeError(f"디스크 공간 부족 — {need // 1048576:,} MB 필요, {free // 1048576:,} MB 남음")
+    tmp.mkdir()
+    root = tmp.resolve()
+    prefix = top + "/"
+    done = 0
+    try:
+        with zipfile.ZipFile(graal_zip_path()) as z:
+            for i in z.infolist():
+                if i.is_dir() or not i.filename.startswith(prefix):
+                    continue
+                rel = i.filename[len(prefix):]
+                dst = (tmp / rel).resolve()
+                if root not in dst.parents:                # zip 경로 탈출 방지
+                    raise RuntimeError(f"잘못된 zip 경로: {i.filename}")
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                with z.open(i) as src, open(dst, "wb") as out:
+                    shutil.copyfileobj(src, out, 1 << 20)
+                done += i.file_size
+                progress(f"GraalVM 압축 해제 중… {done // 1048576:,} / {size // 1048576:,} MB",
+                         int(done * 100 / max(size, 1)))
+    except BaseException:
+        _rmtree(tmp)
+        raise
+    if not is_graal_release(read_release(tmp)):
+        _rmtree(tmp)
+        raise RuntimeError("압축 해제 결과 검증 실패 (release 파일 없음)")
+    return tmp
+
+
+def _apply_graal(game_dir: Path, progress):
+    info = graal_zip_info()
+    jre = game_dir / "jre64"
+    bdir = game_dir / OPT_BACKUP_DIRNAME
+    bjre = bdir / "jre64"
+    st = jre_state(game_dir)
+    cur_ver = read_release(jre).get("GRAALVM_VERSION")
+    if not (st == "graal" and cur_ver == info[1].get("GRAALVM_VERSION")):
+        if st != "vanilla" and not bjre.exists():
+            raise RuntimeError("원본 jre64 백업이 없음 — Steam '게임 파일 무결성 검사'로 "
+                               "원본을 받은 뒤 다시 시도해 주세요")
+        # 먼저 다 풀어놓고 나서 바꿔치기 → 중간에 실패해도 jre64 는 그대로 남는다
+        tmp = _extract_graal(game_dir, progress)
+        progress("JRE 교체 중…", 100)
+        if st == "vanilla":
+            # 지금 원본이 기존 백업보다 최신이다 (Steam 이 PZ 업데이트로 갈아끼웠을 수 있음)
+            if bjre.exists():
+                _rmtree(bjre)
+            bdir.mkdir(parents=True, exist_ok=True)
+            os.replace(jre, bjre)                          # 같은 드라이브 → 이름만 이동
+        elif jre.exists():
+            _rmtree(jre)                                   # 섞인/다른 버전 Graal → 버림
+        os.replace(tmp, jre)
+    _edit_json_vmargs(game_dir, lambda a: a + [x for x in GRAAL_VMARGS if x not in a])
+    bpath = game_dir / "ProjectZomboid64.bat"
+    if bpath.exists():
+        raw = bpath.read_text(encoding="utf-8", errors="replace")
+        bpath.write_text(_bat_add_args(raw, GRAAL_VMARGS), encoding="utf-8")
+
+
+def _restore_graal(game_dir: Path, progress):
+    _edit_json_vmargs(game_dir, lambda a: [x for x in a if x not in GRAAL_VMARGS])
+    bpath = game_dir / "ProjectZomboid64.bat"
+    if bpath.exists():
+        raw = bpath.read_text(encoding="utf-8", errors="replace")
+        bpath.write_text(_bat_remove_args(raw, GRAAL_VMARGS), encoding="utf-8")
+    if jre_state(game_dir) == "vanilla":
+        return
+    jre, bjre = game_dir / "jre64", game_dir / OPT_BACKUP_DIRNAME / "jre64"
+    if not bjre.exists():
+        raise RuntimeError("원본 jre64 백업이 없음 — Steam '게임 파일 무결성 검사'로 복원해 주세요")
+    progress("원본 JRE 복원 중…", 100)
+    if jre.exists():
+        _rmtree(jre)
+    os.replace(bjre, jre)
+
+
+def apply_opt_group(g, game_dir, progress):
+    """항목 적용. 권한 문제는 PermissionError 그대로 던짐."""
+    if g.kind == "class":
+        conf = opt_conf_dir()
+        for rel in g.files:
+            _backup_once(game_dir, Path(rel))
+        for rel in g.files:
+            fname = rel.rsplit("/", 1)[-1]
+            src, dst = conf / fname, game_dir / rel
+            shutil.copy2(src, dst)
+            if dst.read_bytes() != src.read_bytes():
+                raise RuntimeError(f"복사 검증 실패: {fname}")
+    elif g.kind == "heap":
+        _apply_heap(game_dir)
+    else:
+        _apply_graal(game_dir, progress)
+
+
+def restore_opt_group(g, game_dir, progress):
+    """원본으로 되돌린다. 백업이 없으면 RuntimeError."""
+    if g.kind == "heap":
+        _restore_heap(game_dir)
+        return
+    if g.kind == "graal":
+        _restore_graal(game_dir, progress)
+        return
+    bdir = game_dir / OPT_BACKUP_DIRNAME
+    n = 0
+    for rel in g.files:
+        src = bdir / rel
+        if src.exists():
+            dst = game_dir / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            n += 1
+    if n == 0:
+        raise RuntimeError(f"'{g.label}' 백업이 없음 — Steam '게임 파일 무결성 검사'로 복원해 주세요")
+
+
+def apply_opt_selection(game_dir, keys, progress=lambda t, p: None):
+    """체크된 항목은 적용, 체크 해제된 항목은 원본 복원. 반환: (적용수, 복원수).
+       적용 불가 항목은 건드리지 않는다. 끝나면 상태 기록을 갱신한다.
+       순서: heap 이 graal 보다 먼저 (둘 다 json 을 고치지만 서로의 인자는 보존한다)."""
+    keys = set(keys or [])
+    applied = restored = 0
+    try:
+        for g in OPT_GROUPS:
+            ok, _ = opt_group_available(g, game_dir)
+            if not ok:
+                continue
+            if g.key in keys:
+                if not opt_group_applied(g, game_dir):
+                    progress(f"적용 중: {g.label}", 0)
+                    apply_opt_group(g, game_dir, progress)
+                    applied += 1
+            elif opt_group_touched(g, game_dir):
+                progress(f"복원 중: {g.label}", 0)
+                restore_opt_group(g, game_dir, progress)
+                restored += 1
+    finally:
+        write_state(game_dir)
+    return applied, restored
+
+
+# ── 상태 기록 (퐁듀 런처가 읽음) ──────────────────────────────────────────────
+# 런처는 그룹 key 를 몰라도 된다 — 레코드에 든 필드(files / xmx_mb / graalvm_version)만 보고
+# 현재 디스크와 대조한다. 그래서 여기서 항목을 추가해도 런처 수정이 필요 없다.
+def write_state(game_dir: Path):
+    groups = {}
+    for g in OPT_GROUPS:
+        ok, _ = opt_group_available(g, game_dir)
+        if not ok or not opt_group_applied(g, game_dir):
+            continue
+        if g.kind == "class":
+            groups[g.key] = {"files": {rel: _sha256(game_dir / rel) for rel in g.files}}
+        elif g.kind == "heap":
+            groups[g.key] = {"xmx_mb": _json_heap_mb(game_dir)}
+        else:
+            groups[g.key] = {
+                "graalvm_version": read_release(game_dir / "jre64").get("GRAALVM_VERSION", ""),
+                "vmargs": list(GRAAL_VMARGS),
+            }
+    bdir = game_dir / OPT_BACKUP_DIRNAME
+    if not groups and not bdir.exists():
+        return
+    try:
+        bdir.mkdir(parents=True, exist_ok=True)
+        data = {"tool": APP_TITLE, "version": VERSION, "time": int(time.time()), "groups": groups}
+        (bdir / STATE_FILE).write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                                       encoding="utf-8")
+    except OSError:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  UI
+# ═══════════════════════════════════════════════════════════════════════════════
+DARK_QSS = """
+QWidget { background:#23252b; color:#e8e8ea; font-family:'Malgun Gothic','맑은 고딕',sans-serif; font-size:13px; }
+QLineEdit { background:#1b1d22; border:1px solid rgba(255,255,255,0.12); border-radius:8px; padding:7px 10px; color:#e8e8ea; }
+QPushButton { background:#2b2e36; border:1px solid rgba(255,255,255,0.15); border-radius:8px; padding:7px 14px; color:#e8e8ea; }
+QPushButton:hover { background:#343843; }
+QPushButton:disabled { color:#5f5e5a; }
+QPushButton#start { background:#1d9e75; color:#04342c; border:none; font-weight:bold; padding:10px 20px; }
+QPushButton#start:hover { background:#22b384; }
+QPushButton#start:disabled { background:#2b2e36; color:#5f5e5a; border:1px solid rgba(255,255,255,0.12); }
+QPushButton#link  { background:transparent; border:none; color:#85b7eb; padding:2px; }
+QCheckBox { color:#cfd0d4; font-size:13px; }
+QCheckBox:disabled { color:#5f5e5a; }
+QLabel#muted { color:#9a9ca3; font-size:12px; }
+QLabel#hint  { color:#6f7178; font-size:11px; }
+QLabel#warn  { color:#ef9f27; font-size:11px; }
+QLabel#brand { font-size:13px; font-weight:bold; color:#e8e8ea; }
+QLabel#ver   { color:#6f7178; font-size:11px; }
+QLabel#sect  { font-size:15px; font-weight:bold; color:#e8e8ea; }
+QProgressBar { background:#1b1d22; border:1px solid rgba(255,255,255,0.10); border-radius:5px; min-height:10px; max-height:10px; }
+QProgressBar::chunk { background:#1d9e75; border-radius:4px; }
+"""
+
+
+class ApplyWorker(QThread):
+    """파일 작업은 백그라운드에서 (GraalVM 압축 해제가 수십 초 걸릴 수 있음)."""
+    progress = pyqtSignal(str, int)
+    done = pyqtSignal(int, int)
+    failed = pyqtSignal(str)
+
+    def __init__(self, game_dir, keys):
+        super().__init__()
+        self.game_dir, self.keys = game_dir, keys
+
+    def run(self):
+        try:
+            a, r = apply_opt_selection(self.game_dir, self.keys,
+                                       lambda t, p: self.progress.emit(t, p))
+            self.done.emit(a, r)
+        except PermissionError as e:
+            self.failed.emit("쓰기 권한이 없습니다 — 관리자 권한으로 실행해 주세요.\n\n" + str(e))
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+class OptimizerWindow(QWidget):
+    """자동 적용 없음. 창을 열면 디스크의 현재 상태를 읽어 체크박스를 맞춰주고
+       ([적용됨]=체크 / [미적용]=해제), [적용]을 눌렀을 때만 파일을 건드린다."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"{APP_TITLE}  {VERSION}")
+        ico = resource_path(ICON_FILE)
+        if os.path.exists(ico):
+            self.setWindowIcon(QIcon(ico))
+        self.setFixedSize(680, 720)
+        self.game_dir = initial_game_dir()
+        self.boxes = {}
+        self.worker = None
+        self._build()
+        self.setStyleSheet(DARK_QSS)
+        self._reload_state()
+
+    def _lbl(self, t, name):
+        l = QLabel(t); l.setObjectName(name); l.setWordWrap(True); return l
+
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 18, 18, 18); root.setSpacing(10)
+
+        head = QHBoxLayout(); head.setSpacing(8)
+        ico = resource_path(ICON_FILE)
+        if os.path.exists(ico):
+            pm = QPixmap(ico)
+            if not pm.isNull():
+                logo = QLabel()
+                logo.setPixmap(pm.scaled(28, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                head.addWidget(logo)
+        head.addWidget(self._lbl(APP_TITLE, "brand")); head.addStretch(1)
+        head.addWidget(self._lbl(VERSION, "ver"))
+        root.addLayout(head)
+
+        root.addWidget(self._lbl("게임 최적화", "sect"))
+        root.addWidget(self._lbl(
+            "체크한 항목만 게임 파일에 적용됩니다. 원본은 게임 폴더의 "
+            f"{OPT_BACKUP_DIRNAME}/ 에 백업되며, 체크를 해제하면 원본으로 되돌립니다.\n"
+            "PZ 업데이트나 '게임 파일 무결성 검사' 후에는 최적화가 풀리므로 다시 실행해 주세요.",
+            "muted"))
+
+        drow = QHBoxLayout()
+        drow.addWidget(self._lbl("PZ 설치 폴더", "muted"))
+        self.dir_input = QLineEdit(); self.dir_input.setReadOnly(True)
+        drow.addWidget(self.dir_input, 1)
+        self.pick_btn = QPushButton("폴더 선택"); self.pick_btn.setObjectName("link")
+        self.pick_btn.clicked.connect(self._choose_dir)
+        drow.addWidget(self.pick_btn)
+        root.addLayout(drow)
+
+        self.status = self._lbl("", "hint")
+        root.addWidget(self.status)
+
+        host = QWidget()
+        lv = QVBoxLayout(host); lv.setContentsMargins(2, 2, 2, 2); lv.setSpacing(2)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame); scroll.setWidget(host)
+        root.addWidget(scroll, 1)
+        for g in OPT_GROUPS:
+            cb = QCheckBox(g.label)
+            self.boxes[g.key] = cb
+            lv.addWidget(cb)
+            lv.addWidget(self._lbl("     " + "\n     ".join(g.files), "hint"))
+            if g.kind == "graal":
+                self.graal_note = self._lbl("", "warn")
+                lv.addWidget(self.graal_note)
+            lv.addSpacing(6)
+        lv.addStretch(1)
+
+        self.prog_text = self._lbl("", "muted")
+        self.prog = QProgressBar(); self.prog.setTextVisible(False); self.prog.setRange(0, 100)
+        self.prog_text.hide(); self.prog.hide()
+        root.addWidget(self.prog_text); root.addWidget(self.prog)
+
+        brow = QHBoxLayout()
+        self.all_btn = QPushButton("전체 선택"); self.all_btn.setObjectName("link")
+        self.all_btn.clicked.connect(lambda: self._set_all(True))
+        self.none_btn = QPushButton("전체 해제"); self.none_btn.setObjectName("link")
+        self.none_btn.clicked.connect(lambda: self._set_all(False))
+        brow.addWidget(self.all_btn); brow.addWidget(self.none_btn); brow.addStretch(1)
+        self.apply_btn = QPushButton("적용"); self.apply_btn.setObjectName("start")
+        self.apply_btn.clicked.connect(self._apply)
+        brow.addWidget(self.apply_btn)
+        self.close_btn = QPushButton("닫기"); self.close_btn.clicked.connect(self.close)
+        brow.addWidget(self.close_btn)
+        root.addLayout(brow)
+
+    # --- 상태 ---
+    def _set_all(self, on):
+        for cb in self.boxes.values():
+            if cb.isEnabled():
+                cb.setChecked(on)
+
+    def _reload_state(self):
+        """디스크 현재 상태 → 체크박스/활성화/상태문구 반영."""
+        gd = self.game_dir
+        self.dir_input.setText(str(gd) if gd else "")
+        valid = gd is not None and is_pz_dir(gd)
+        for g in OPT_GROUPS:
+            cb = self.boxes[g.key]
+            ok, why = opt_group_available(g, gd if valid else None)
+            cb.setEnabled(ok)
+            cb.setChecked(bool(ok and opt_group_applied(g, gd)))
+            cb.setText(g.label if ok else f"{g.label}  —  {why}")
+
+        msgs = []
+        if gd is None:
+            msgs.append("PZ 설치 폴더를 자동으로 찾지 못했습니다 — 폴더를 직접 지정해 주세요.")
+        elif not valid:
+            msgs.append("이 폴더에 ProjectZomboid64.json 이 없습니다 — PZ 설치 폴더가 맞는지 확인해 주세요.")
+        else:
+            msgs.append(build_label(gd))
+        mb = half_ram_mb()
+        if mb > 0:
+            msgs.append(f"설정될 힙 크기: {mb:,} MB (전체 RAM {total_ram_mb():,} MB 의 절반)")
+        if not is_admin():
+            msgs.append("관리자 권한이 아닙니다 — Program Files 아래 설치본은 적용이 실패할 수 있습니다.")
+        if pz_running():
+            msgs.append("Project Zomboid 실행 중 — 게임을 종료해야 파일을 바꿀 수 있습니다.")
+        self.status.setText("\n".join(msgs))
+
+        notes = []
+        info = graal_zip_info()
+        if info is not None:
+            notes.append(f"포함된 GraalVM {info[1].get('GRAALVM_VERSION', '?')}"
+                         f" · 디스크 약 {info[2] // 1048576:,} MB 사용")
+        if 0 < total_ram_mb() < PRETOUCH_WARN_RAM_MB:
+            notes.append("RAM 32GB 미만 — AlwaysPreTouch 는 시작하자마자 힙 전체를 실제 메모리로 "
+                         "점유하므로 방송 프로그램과 함께 쓰면 버벅일 수 있습니다.")
+        self.graal_note.setText("     " + "\n     ".join(notes) if notes else "")
+        self.apply_btn.setEnabled(valid)
+
+    def _choose_dir(self):
+        start = str(self.game_dir) if self.game_dir else str(Path.home())
+        d = QFileDialog.getExistingDirectory(
+            self, "Project Zomboid 설치 폴더 선택 (ProjectZomboid64.json 이 있는 폴더)", start)
+        if not d:
+            return
+        p = Path(d)
+        if not is_pz_dir(p):
+            QMessageBox.warning(self, APP_TITLE,
+                                "선택한 폴더에 ProjectZomboid64.json 이 없습니다.\n"
+                                "…/steamapps/common/ProjectZomboid 폴더를 선택해 주세요.")
+            return
+        self.game_dir = p
+        cfg = load_config(); cfg["pz_dir"] = str(p); save_config(cfg)
+        self._reload_state()
+
+    # --- 적용 ---
+    def _set_busy(self, busy):
+        for w in (self.apply_btn, self.close_btn, self.pick_btn, self.all_btn, self.none_btn):
+            w.setEnabled(not busy)
+        for cb in self.boxes.values():
+            cb.setAttribute(Qt.WA_TransparentForMouseEvents, busy)
+        self.prog_text.setVisible(busy); self.prog.setVisible(busy)
+
+    def _apply(self):
+        if self.game_dir is None or self.worker is not None:
+            return
+        if pz_running():
+            QMessageBox.information(self, APP_TITLE,
+                                    "Project Zomboid가 실행 중이라 파일을 바꿀 수 없습니다.\n"
+                                    "게임을 먼저 종료해 주세요.")
+            return
+        keys = [k for k, cb in self.boxes.items() if cb.isEnabled() and cb.isChecked()]
+        cfg = load_config(); cfg["pz_dir"] = str(self.game_dir); save_config(cfg)
+        self._set_busy(True)
+        self.prog.setValue(0); self.prog_text.setText("준비 중…")
+        self.worker = ApplyWorker(self.game_dir, keys)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.done.connect(self._on_done)
+        self.worker.failed.connect(self._on_failed)
+        self.worker.start()
+
+    def _on_progress(self, text, pct):
+        self.prog_text.setText(text); self.prog.setValue(pct)
+
+    def _finish(self):
+        if self.worker is not None:
+            self.worker.wait()
+            self.worker = None
+        self._set_busy(False)
+        self._reload_state()
+
+    def _on_done(self, applied, restored):
+        self._finish()
+        if applied or restored:
+            QMessageBox.information(self, APP_TITLE, f"완료!\n\n적용 {applied}개 · 원본 복원 {restored}개")
+        else:
+            QMessageBox.information(self, APP_TITLE, "변경할 항목이 없습니다.")
+
+    def _on_failed(self, msg):
+        self._finish()
+        QMessageBox.warning(self, APP_TITLE, f"실패: {msg}")
+
+    def closeEvent(self, e):
+        if self.worker is not None:          # 압축 해제/교체 도중 종료 방지
+            e.ignore()
+            return
+        super().closeEvent(e)
+
+
+def main():
+    app = QApplication(sys.argv)
+    ico = resource_path(ICON_FILE)
+    if os.path.exists(ico):
+        app.setWindowIcon(QIcon(ico))
+    w = OptimizerWindow()
+    w.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
