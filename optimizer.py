@@ -50,7 +50,7 @@ from PyQt5.QtWidgets import (
 )
 
 
-VERSION = "v1.5.1"
+VERSION = "v1.5.2"
 APP_TITLE = "PZ Optimizer"
 PAGE_TITLE = "프로젝트 좀보이드 최적화 툴"
 
@@ -1785,19 +1785,6 @@ class OptimizerWindow(QWidget):
         zh.addWidget(self.zb_btn)
         root.addWidget(self.zb_box)
 
-        # PZ_Optimization (B42 전용 수동 설치 모드) 설치·업데이트·제거
-        self.po_box = QFrame(); self.po_box.setObjectName("box")
-        ph = QHBoxLayout(self.po_box); ph.setContentsMargins(12, 10, 12, 10); ph.setSpacing(10)
-        pv = QVBoxLayout(); pv.setSpacing(2)
-        self.po_state = self._lbl("", "zbstate")
-        self.po_detail = self._lbl("", "hint")
-        pv.addWidget(self.po_state); pv.addWidget(self.po_detail)
-        ph.addLayout(pv, 1)
-        self.po_btn = QPushButton("PZ OP 적용"); self.po_btn.setObjectName("zb")
-        self.po_btn.clicked.connect(self._po_click)
-        ph.addWidget(self.po_btn)
-        root.addWidget(self.po_box)
-
         # 텍스쳐 최적화 (Every Texture Optimized) 적용·적용 해제
         self.tx_box = QFrame(); self.tx_box.setObjectName("box")
         th = QHBoxLayout(self.tx_box); th.setContentsMargins(12, 10, 12, 10); th.setSpacing(10)
@@ -1859,6 +1846,19 @@ class OptimizerWindow(QWidget):
         lv.addStretch(1)
         self.opt_scroll.hide()
         root.addWidget(self.opt_box)
+
+        # PZ_Optimization (B42 전용 수동 설치 모드) 설치·업데이트·제거
+        self.po_box = QFrame(); self.po_box.setObjectName("box")
+        ph = QHBoxLayout(self.po_box); ph.setContentsMargins(12, 10, 12, 10); ph.setSpacing(10)
+        pv = QVBoxLayout(); pv.setSpacing(2)
+        self.po_state = self._lbl("", "zbstate")
+        self.po_detail = self._lbl("", "hint")
+        pv.addWidget(self.po_state); pv.addWidget(self.po_detail)
+        ph.addLayout(pv, 1)
+        self.po_btn = QPushButton("PZ OP 적용"); self.po_btn.setObjectName("zb")
+        self.po_btn.clicked.connect(self._po_click)
+        ph.addWidget(self.po_btn)
+        root.addWidget(self.po_box)
         root.addStretch(1)
         self._stretch_idx = root.count() - 1
         self._root = root
@@ -2007,6 +2007,19 @@ class OptimizerWindow(QWidget):
             t = time.strftime("%Y-%m-%d", time.localtime(int(p.get("built", "0") or 0))) if p.get("built") else "?"
             return f"{p.get('commit', '?')} ({t})"
 
+        def ws_ver(p):
+            """워크샵 버전: Steam 에 올라온 시각(acf timeupdated = 창작마당 페이지의 '업데이트' 시각) + 커밋.
+               acf 에 기록이 없으면 빌드 시각(built)으로 대신한다."""
+            if not p:
+                return "?"
+            ts = st["ws"].get("installed_time") or int(p.get("built", "0") or 0)
+            if not ts:
+                return p.get("commit", "?")
+            lt = time.localtime(ts)
+            h = lt.tm_hour % 12 or 12
+            when = f"{lt.tm_year}년 {lt.tm_mon}월 {lt.tm_mday}일 {'오전' if lt.tm_hour < 12 else '오후'} {h}시 {lt.tm_min}분"
+            return f"{when} ({p.get('commit', '?')})"
+
         state = st["state"]
         detail = []
         if state == "installed":
@@ -2028,7 +2041,7 @@ class OptimizerWindow(QWidget):
             self.po_btn.setText("PZ OP 적용")
             detail.append("창작마당에서 PZ_Optimization 모드를 구독하면 여기서 적용할 수 있습니다.")
         else:
-            self.po_state.setText(f"PZ OP 미적용  ·  워크샵 {ver(match[1] if match else None)}")
+            self.po_state.setText(f"PZ OP 미적용  ·  워크샵 버전: {ws_ver(match[1] if match else None)}")
             self.po_btn.setText("PZ OP 적용")
         if state in ("installed", "outdated", "none", "unfinished"):
             detail.append("힙·GC·JIT 를 바꾸는 이 모드의 게임 내 설정은 위 힙/GraalVM 항목과 겹칩니다 — 한쪽만 쓰세요.")
