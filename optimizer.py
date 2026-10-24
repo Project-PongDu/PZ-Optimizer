@@ -50,7 +50,7 @@ from PyQt5.QtWidgets import (
 )
 
 
-VERSION = "v1.3.0"
+VERSION = "v1.3.1"
 APP_TITLE = "PZ Optimizer"
 PAGE_TITLE = "프로젝트 좀보이드 최적화 툴"
 
@@ -1265,7 +1265,10 @@ QLabel#warn  { color:#ef9f27; font-size:11px; }
 QLabel#info  { color:#cfd0d4; font-size:13px; }
 QLabel#zbstate { color:#cfd0d4; font-size:13px; }
 QFrame#box   { background:#1b1d22; border:1px solid rgba(255,255,255,0.08); border-radius:8px; }
-QFrame#box QLabel { background:transparent; }
+QFrame#box QLabel, QFrame#box QScrollArea, QFrame#box QCheckBox, QWidget#clear { background:transparent; }
+QCheckBox::indicator { width:14px; height:14px; border:1px solid #6f7178; border-radius:3px; background:#15171b; }
+QCheckBox::indicator:checked { background:#1d9e75; border:1px solid #1d9e75; }
+QCheckBox::indicator:disabled { border:1px solid #3a3c42; background:#1b1d22; }
 QPushButton#zb { background:#2b2e36; border:1px solid #1d9e75; color:#5dcaa5; font-weight:bold; padding:7px 14px; }
 QPushButton#zb:hover { background:#343843; }
 QPushButton#zb:disabled { border:1px solid rgba(255,255,255,0.12); color:#5f5e5a; }
@@ -1317,7 +1320,34 @@ class OptimizerWindow(QWidget):
         self._pending_update = None    # 적용 작업 중에 새 버전이 확인되면 끝난 뒤 띄운다
         self._build()
         self.setStyleSheet(DARK_QSS)
+        self._set_expanded(False)
         self._reload_state()
+
+    def _indented(self, w, left=22):
+        """줄바꿈된 둘째 줄까지 같은 위치에서 시작하도록 공백 대신 여백으로 들여쓴다."""
+        box = QWidget(); box.setObjectName("clear")
+        h = QHBoxLayout(box); h.setContentsMargins(left, 0, 0, 0); h.setSpacing(0)
+        h.addWidget(w)
+        return box
+
+    def _set_expanded(self, on):
+        self._expanded = on
+        self.opt_scroll.setVisible(on)
+        i = self._root.indexOf(self.opt_box)
+        self._root.setStretch(i, 1 if on else 0)
+        self._root.setStretch(self._stretch_idx, 0 if on else 1)
+        self.opt_btn.setText("일반 최적화  ▴" if on else "일반 최적화  ▾")
+        self.all_btn.setVisible(on); self.none_btn.setVisible(on)
+        self.apply_btn.setVisible(on)        # 일반 최적화 전용 버튼 — 접혀 있으면 숨김
+
+    def _opt_summary(self, *_):
+        shown = [g for g in OPT_GROUPS if not self.rows[g.key].isHidden() and self.boxes[g.key].isEnabled()]
+        applied = [g for g in shown if opt_group_applied(g, self.game_dir)]
+        checked = [g for g in shown if self.boxes[g.key].isChecked()]
+        self.opt_state.setText(f"일반 최적화  ·  {len(applied)} / {len(shown)} 항목 적용됨")
+        pending = len({g.key for g in checked} ^ {g.key for g in applied})
+        self.opt_detail.setText(f"변경 대기 {pending}개 — [적용]을 눌러야 반영됩니다." if pending
+                                else "버튼을 눌러 항목을 펼치고, 체크한 뒤 [적용]을 누르세요.")
 
     def _lbl(self, t, name):
         l = QLabel(t); l.setObjectName(name); l.setWordWrap(True); return l
@@ -1360,26 +1390,49 @@ class OptimizerWindow(QWidget):
         zh.addWidget(self.zb_btn)
         root.addWidget(self.zb_box)
 
-        host = QWidget()
+        # 일반 최적화 — ZombieBuddy 박스와 같은 양식. 버튼으로 체크박스 목록을 펼치고 접는다.
+        self.opt_box = QFrame(); self.opt_box.setObjectName("box")
+        ov = QVBoxLayout(self.opt_box); ov.setContentsMargins(12, 10, 12, 10); ov.setSpacing(8)
+        oh = QHBoxLayout(); oh.setSpacing(10)
+        ohv = QVBoxLayout(); ohv.setSpacing(2)
+        self.opt_state = self._lbl("", "zbstate")
+        self.opt_detail = self._lbl("", "hint")
+        ohv.addWidget(self.opt_state); ohv.addWidget(self.opt_detail)
+        oh.addLayout(ohv, 1)
+        self.opt_btn = QPushButton(); self.opt_btn.setObjectName("zb")
+        self.opt_btn.clicked.connect(lambda: self._set_expanded(not self._expanded))
+        oh.addWidget(self.opt_btn)
+        ov.addLayout(oh)
+
+        host = QWidget(); host.setObjectName("clear")
         lv = QVBoxLayout(host); lv.setContentsMargins(2, 2, 2, 2); lv.setSpacing(2)
-        scroll = QScrollArea(); scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame); scroll.setWidget(host)
-        root.addWidget(scroll, 1)
+        self.opt_scroll = QScrollArea(); self.opt_scroll.setWidgetResizable(True)
+        self.opt_scroll.setFrameShape(QFrame.NoFrame); self.opt_scroll.setWidget(host)
+        self.opt_scroll.viewport().setObjectName("clear")
+        ov.addWidget(self.opt_scroll, 1)
         for g in OPT_GROUPS:
-            row = QWidget()
+            row = QWidget(); row.setObjectName("clear")
             rv = QVBoxLayout(row); rv.setContentsMargins(0, 0, 0, 6); rv.setSpacing(2)
             cb = QCheckBox(g.label)
             self.boxes[g.key] = cb
+            cb.toggled.connect(self._opt_summary)
             rv.addWidget(cb)
-            rv.addWidget(self._lbl("     " + "\n     ".join(g.files), "hint"))
+            rv.addWidget(self._indented(self._lbl("\n".join(g.files), "hint")))
             if g.kind == "graal":
                 self.graal_note = self._lbl("", "warn")
-                rv.addWidget(self.graal_note)
+                rv.addWidget(self._indented(self.graal_note))
             self.rows[g.key] = row
             lv.addWidget(row)
-        self.empty_hint = self._lbl("PZ 설치 폴더를 지정하면 그 빌드에 맞는 항목이 표시됩니다.", "hint")
-        lv.addWidget(self.empty_hint)
         lv.addStretch(1)
+        self.opt_scroll.hide()
+        root.addWidget(self.opt_box)
+        root.addStretch(1)
+        self._stretch_idx = root.count() - 1
+        self._root = root
+        self._expanded = False
+        self.empty_hint = self._lbl("PZ 설치 폴더를 지정하면 그 빌드에 맞는 항목이 표시됩니다.", "hint")
+        root.insertWidget(self._stretch_idx, self.empty_hint)
+        self._stretch_idx += 1
 
         self.prog_text = self._lbl("", "muted")
         self.prog = QProgressBar(); self.prog.setTextVisible(False); self.prog.setRange(0, 100)
@@ -1452,8 +1505,11 @@ class OptimizerWindow(QWidget):
         if 0 < total_ram_mb() < PRETOUCH_WARN_RAM_MB:
             notes.append("RAM 32GB 미만 — AlwaysPreTouch 는 시작하자마자 힙 전체를 실제 메모리로 "
                          "점유하므로 방송 프로그램과 함께 쓰면 버벅일 수 있습니다.")
-        self.graal_note.setText("     " + "\n     ".join(notes) if notes else "")
+        self.graal_note.setText("\n".join(notes))
+        self.graal_note.setVisible(bool(notes))
         self.empty_hint.setVisible(not valid)
+        self.opt_box.setVisible(valid)
+        self._opt_summary()
         self.apply_btn.setEnabled(valid)
 
     # --- ZombieBuddy ---
