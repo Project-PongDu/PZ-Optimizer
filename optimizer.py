@@ -50,7 +50,7 @@ from PyQt5.QtWidgets import (
 )
 
 
-VERSION = "v1.2.0"
+VERSION = "v1.3.0"
 APP_TITLE = "PZ Optimizer"
 PAGE_TITLE = "프로젝트 좀보이드 최적화 툴"
 
@@ -819,6 +819,432 @@ def write_state(game_dir: Path):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  ZombieBuddy 적용/해제 (ZombieBuddyInstaller.exe 의 Install/Uninstall 과 같은 작업)
+#
+#  ZombieBuddyInstaller.exe (Go, zed-0xff) 가 하는 일을 그대로 옮겼다:
+#    적용  1) 구독한 ZB 워크샵 폴더 mods/ZombieBuddy/libs/ 의 zbNative.dll, ZombieBuddy.jar → 게임 폴더
+#          2) ProjectZomboid64.json vmArgs 맨 앞에 -agentlib:zbNative
+#          3) ProjectZomboid64.bat 의 SET _JAVA_OPTIONS= 값 앞에 -agentlib:zbNative (줄이 없으면 맨 위에 추가)
+#          4) Steam userdata/*/config/localconfig.vdf 의 PZ(108600) LaunchOptions 에 -agentlib:zbNative --
+#    해제  위 1~4 를 되돌림 (+ ZB 가 자체 업데이트로 남긴 ZombieBuddy.jar.new 삭제)
+#
+#  설치기와 다르게 한 부분 (호환 범위 안에서 더 안전하게):
+#    · Steam 실행 옵션은 '덮어쓰기'가 아니라 '앞에 끼워넣기'. 설치기는 기존 옵션을 통째로
+#      "-agentlib:zbNative --" 로 바꿔 사용자가 넣어둔 -Xmx, -debug 등이 사라진다.
+#      기존 옵션에 "--" 가 없으면 전부 게임 인자이므로 "-agentlib:zbNative -- <기존>" 으로 넣는다.
+#    · Steam 실행 옵션은 '선택한 폴더가 Steam 정식 설치본일 때만' 건드린다. 복사본 폴더(예: B41 보관용)
+#      에 적용하면서 Steam 옵션을 넣으면, dll 이 없는 정식 설치본이 "agent library 없음"으로 안 켜진다.
+#    · localconfig.vdf 는 수정 전에 %APPDATA%\PZ-Optimizer\backup\ 에 사본을 남긴다.
+#
+#  최신본 반영:
+#    · 복사 원본은 항상 '지금 구독 중인 워크샵 폴더' → Steam 이 ZB 모드를 업데이트하면 그 파일이 쓰인다.
+#      게임 폴더 사본이 워크샵과 다르면 '업데이트 필요'로 표시하고 버튼이 [업데이트]가 된다.
+#    · 설치기 소스(installer/installer.go)가 모드에 같이 들어 있어서, 실행 인자·복사 파일 목록·설치기 버전은
+#      그 소스에서 매번 읽는다 (설치기가 바뀌면 같이 따라감). 못 읽으면 아래 기본값.
+#    · 설치기의 주(major) 버전이 아래 ZB_KNOWN_INSTALLER_MAJOR 와 다르면 동작 방식이 바뀌었을 수 있다는
+#      경고를 띄운다 → PZ Optimizer 업데이트로 맞춘다.
+# ═══════════════════════════════════════════════════════════════════════════════
+ZB_WORKSHOP_ID = "3619862853"
+ZB_DEFAULT_LAUNCH_ARG = "-agentlib:zbNative"
+ZB_DEFAULT_CORE_FILES = ["zbNative.dll", "ZombieBuddy.jar"]
+ZB_EXTRA_REMOVE_FILES = ["ZombieBuddy.jar.new"]       # ZB 자체 업데이트 임시 파일 (해제 시 함께 삭제)
+ZB_KNOWN_INSTALLER_MAJOR = 4                           # 이 동작을 옮겨온 설치기 버전 (v4.1)
+
+
+def zb_mod_dir():
+    """구독한 ZombieBuddy 워크샵 폴더(.../3619862853/mods/ZombieBuddy). 없으면 None."""
+    for root in _steam_roots():
+        for lib in _libraries_from(root):
+            d = lib / "steamapps" / "workshop" / "content" / PZ_APPID / ZB_WORKSHOP_ID / "mods" / "ZombieBuddy"
+            if (d / "libs").is_dir():
+                return d
+    return None
+
+
+_ZB_SPEC_CACHE = {}
+
+
+def zb_spec(mod_dir):
+    """설치기 소스에서 읽은 {launch_arg, core_files, installer_version, mod_version}."""
+    key = str(mod_dir)
+    if key in _ZB_SPEC_CACHE:
+        return _ZB_SPEC_CACHE[key]
+    spec = {"launch_arg": ZB_DEFAULT_LAUNCH_ARG, "core_files": list(ZB_DEFAULT_CORE_FILES),
+            "installer_version": "", "mod_version": ""}
+    if mod_dir is not None:
+        try:
+            src = (Path(mod_dir) / "installer" / "installer.go").read_text(encoding="utf-8", errors="replace")
+            m = re.search(r'ZB_LAUNCH_ARG\s*=\s*"([^"]+)"', src)
+            if m:
+                spec["launch_arg"] = m.group(1)
+            m = re.search(r'INSTALLER_VERSION\s*=\s*"([^"]+)"', src)
+            if m:
+                spec["installer_version"] = m.group(1)
+            m = re.search(r'func copyCoreFiles\(.*?files\s*:=\s*\[\]string\{([^}]*)\}', src, re.S)
+            if m:
+                files = re.findall(r'"([^"]+)"', m.group(1))
+                if files:
+                    spec["core_files"] = files
+        except OSError:
+            pass
+        try:
+            spec["mod_version"] = (Path(mod_dir) / "java" / "VERSION").read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+    _ZB_SPEC_CACHE[key] = spec
+    return spec
+
+
+def zb_installer_mismatch(spec) -> bool:
+    v = parse_version(spec.get("installer_version"))
+    return bool(v) and v[0] != ZB_KNOWN_INSTALLER_MAJOR
+
+
+def _is_zb_opt(tok, arg) -> bool:
+    return tok == arg or tok.startswith(arg + "=")
+
+
+def steam_running() -> bool:
+    if os.name != "nt":
+        return False
+    import subprocess
+    try:
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq steam.exe", "/NH"],
+                             capture_output=True, text=True, creationflags=0x08000000).stdout.lower()
+        return "steam.exe" in out
+    except Exception:
+        return False
+
+
+def steam_main_path():
+    """Steam 본체 경로 (userdata 가 있는 곳). HKCU SteamPath 우선."""
+    for r in _steam_roots():
+        if (r / "userdata").is_dir():
+            return r
+    return None
+
+
+def is_steam_install(game_dir) -> bool:
+    """선택한 폴더가 Steam 이 실행하는 정식 설치본인가 (Steam 실행 옵션을 건드려도 되는가)."""
+    official = find_pz_dir()
+    try:
+        return official is not None and Path(game_dir).resolve() == Path(official).resolve()
+    except OSError:
+        return False
+
+
+# ── Steam localconfig.vdf (텍스트 VDF) — 위치 정보를 가진 최소 파서 ──────────────
+_VDF_TOKEN_RE = re.compile(r'"((?:[^"\\]|\\.)*)"|([{}])|(//[^\n]*)')
+
+
+def _vdf_unescape(s):
+    return s.replace('\\"', '"').replace("\\\\", "\\")
+
+
+def _vdf_escape(s):
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _vdf_parse(text):
+    """{key_lower: node} 트리. node = {"key", "span"(값 따옴표 포함 범위) | "open","close", "children"}"""
+    toks = [(m.start(), m.end(), m.group(1), m.group(2)) for m in _VDF_TOKEN_RE.finditer(text) if not m.group(3)]
+    pos = 0
+
+    def block(close_expected):
+        nonlocal pos
+        children = []
+        while pos < len(toks):
+            st, en, q, br = toks[pos]
+            if br == "}":
+                pos += 1
+                return children, st
+            if q is None:                     # 예상 못 한 '{' — 건너뜀
+                pos += 1
+                continue
+            key = _vdf_unescape(q)
+            pos += 1
+            if pos >= len(toks):
+                break
+            st2, en2, q2, br2 = toks[pos]
+            if br2 == "{":
+                pos += 1
+                kids, close = block(True)
+                children.append({"key": key, "open": st2, "close": close, "children": kids})
+            elif q2 is not None:
+                pos += 1
+                children.append({"key": key, "value": _vdf_unescape(q2), "span": (st2, en2)})
+        return children, len(text)
+
+    root, _ = block(False)
+    return root
+
+
+def _vdf_find(children, *path):
+    cur = children
+    node = None
+    for k in path:
+        node = next((c for c in cur if c["key"].lower() == k.lower()), None)
+        if node is None or "children" not in node:
+            return None
+        cur = node["children"]
+    return node
+
+
+_VDF_APPS_PATH = ("UserLocalConfigStore", "Software", "Valve", "Steam", "apps")
+
+
+def vdf_get_launch_options(text):
+    """(LaunchOptions 문자열 | None, apps 블록 존재 여부)"""
+    tree = _vdf_parse(text)
+    app = _vdf_find(tree, *_VDF_APPS_PATH, PZ_APPID)
+    if app is None:
+        return None, _vdf_find(tree, *_VDF_APPS_PATH) is not None
+    lo = next((c for c in app["children"] if c["key"].lower() == "launchoptions" and "value" in c), None)
+    return (lo["value"] if lo else ""), True
+
+
+def vdf_set_launch_options(text, new_opts):
+    """PZ 앱 블록의 LaunchOptions 를 new_opts 로 (없으면 추가, 앱 블록이 없으면 생성)."""
+    tree = _vdf_parse(text)
+    apps = _vdf_find(tree, *_VDF_APPS_PATH)
+    if apps is None:
+        raise RuntimeError("localconfig.vdf 에 apps 블록이 없음")
+    val = '"' + _vdf_escape(new_opts) + '"'
+    app = next((c for c in apps["children"] if c["key"].lower() == PZ_APPID and "children" in c), None)
+    if app is not None:
+        lo = next((c for c in app["children"] if c["key"].lower() == "launchoptions" and "value" in c), None)
+        if lo is not None:
+            a, b = lo["span"]
+            return text[:a] + val + text[b:]
+        # 닫는 괄호 앞에 새 줄로 추가 (닫는 괄호 줄의 들여쓰기 + 탭)
+        close = app["close"]
+        ls = text.rfind("\n", 0, close) + 1
+        indent = text[ls:close]
+        return text[:ls] + indent + '\t"LaunchOptions"\t\t' + val + "\n" + text[ls:]
+    close = apps["close"]
+    ls = text.rfind("\n", 0, close) + 1
+    ind = text[ls:close] + "\t"
+    block = (f'{ind}"{PZ_APPID}"\n{ind}{{\n{ind}\t"LaunchOptions"\t\t{val}\n{ind}}}\n')
+    return text[:ls] + block + text[ls:]
+
+
+def launch_opts_add(opts, arg):
+    """'-agentlib:zbNative' 를 JVM 인자 구역(-- 앞)에 넣는다. 이미 있으면 그대로."""
+    toks = opts.split()
+    if any(_is_zb_opt(t, arg) for t in toks):
+        return opts, False
+    if "--" in toks:
+        return " ".join([arg] + toks), True
+    return " ".join([arg, "--"] + toks), True      # -- 가 없으면 기존 것은 전부 게임 인자
+
+
+def launch_opts_remove(opts, arg):
+    toks = opts.split()
+    kept = [t for t in toks if not _is_zb_opt(t, arg)]
+    if len(kept) == len(toks):
+        return opts, False
+    if kept and kept[0] == "--":                     # 우리가 붙인 '--' 만 남았으면 같이 제거
+        kept = kept[1:]
+    return " ".join(kept), True
+
+
+def _steam_localconfigs():
+    sp = steam_main_path()
+    if sp is None:
+        return []
+    out = []
+    for d in sorted((sp / "userdata").iterdir()):
+        p = d / "config" / "localconfig.vdf"
+        if d.is_dir() and p.is_file():
+            out.append(p)
+    return out
+
+
+def _backup_localconfig(p: Path):
+    base = os.environ.get("APPDATA") or str(Path.home())
+    bdir = Path(base) / "PZ-Optimizer" / "backup"
+    bdir.mkdir(parents=True, exist_ok=True)
+    uid = p.parent.parent.name
+    shutil.copy2(p, bdir / f"localconfig_{uid}_{time.strftime('%Y%m%d_%H%M%S')}.vdf")
+
+
+def _steam_opts_state(arg):
+    """[(경로, 현재 옵션 | None)] — PZ 항목이 없으면 None."""
+    out = []
+    for p in _steam_localconfigs():
+        try:
+            opts, _ = vdf_get_launch_options(p.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            opts = None
+        out.append((p, opts))
+    return out
+
+
+# ── bat 의 SET _JAVA_OPTIONS= 처리 (설치기와 동일 규칙) ───────────────────────────
+_JAVA_OPTS_RE = re.compile(r"^([ \t]*)SET _JAVA_OPTIONS=(.*)$", re.I)
+
+
+def _bat_zb_has(raw, arg):
+    for ln in raw.splitlines():
+        m = _JAVA_OPTS_RE.match(ln)
+        if m:
+            return any(_is_zb_opt(t, arg) for t in m.group(2).split())
+    return False
+
+
+def _bat_zb_edit(raw, arg, install):
+    nl = "\r\n" if "\r\n" in raw else "\n"
+    lines = raw.replace("\r\n", "\n").split("\n")
+    for i, ln in enumerate(lines):
+        m = _JAVA_OPTS_RE.match(ln)
+        if not m:
+            continue
+        toks = m.group(2).split()
+        if install:
+            if any(_is_zb_opt(t, arg) for t in toks):
+                return raw, False
+            toks = [arg] + toks
+        else:
+            kept = [t for t in toks if not _is_zb_opt(t, arg)]
+            if len(kept) == len(toks):
+                return raw, False
+            toks = kept
+        lines[i] = m.group(1) + "SET _JAVA_OPTIONS=" + " ".join(toks)
+        return nl.join(lines), True
+    if install:
+        return nl.join(["SET _JAVA_OPTIONS=" + arg] + lines), True
+    return raw, False
+
+
+# ── 상태 / 적용 / 해제 ────────────────────────────────────────────────────────
+def zb_status(game_dir):
+    """dict: state('none'|'partial'|'applied'|'outdated'|'nomod'), parts, notes, spec, steam_ok"""
+    mod = zb_mod_dir()
+    spec = zb_spec(mod)
+    arg = spec["launch_arg"]
+    gd = Path(game_dir)
+    parts = {}
+    parts["files"] = all((gd / f).is_file() for f in spec["core_files"])
+    parts["json"] = any(_is_zb_opt(a, arg) for a in _json_vmargs(gd))
+    bat = gd / "ProjectZomboid64.bat"
+    if bat.exists():
+        try:
+            parts["bat"] = _bat_zb_has(bat.read_text(encoding="utf-8", errors="replace"), arg)
+        except OSError:
+            parts["bat"] = False
+    steam_ok = is_steam_install(gd) and bool(_steam_localconfigs())
+    if steam_ok:
+        st = _steam_opts_state(arg)
+        parts["steam"] = any(o is not None and any(_is_zb_opt(t, arg) for t in o.split()) for _, o in st)
+    any_on = any(parts.values())
+    all_on = all(parts.values())
+    state = "applied" if all_on else ("partial" if any_on else "none")
+    outdated = False
+    if parts["files"] and mod is not None:
+        for f in spec["core_files"]:
+            src = mod / "libs" / f
+            if not src.is_file():
+                continue
+            cur = gd / f
+            new = gd / (f + ".new")
+            h = _sha256(src)
+            if _sha256(cur) != h and not (new.is_file() and _sha256(new) == h):
+                outdated = True
+    if state == "applied" and outdated:
+        state = "outdated"
+    if mod is None and state == "none":
+        state = "nomod"
+    return {"state": state, "parts": parts, "spec": spec, "mod": mod, "steam_ok": steam_ok}
+
+
+def zb_apply(game_dir):
+    """설치기 Install 과 같은 작업. 반환: 바뀐 항목 설명 리스트."""
+    gd = Path(game_dir)
+    mod = zb_mod_dir()
+    if mod is None:
+        raise RuntimeError("ZombieBuddy 모드를 찾을 수 없음 — 스팀 창작마당에서 ZombieBuddy 를 구독해 주세요\n"
+                           "https://steamcommunity.com/sharedfiles/filedetails/?id=" + ZB_WORKSHOP_ID)
+    spec = zb_spec(mod)
+    arg = spec["launch_arg"]
+    use_steam = is_steam_install(gd) and bool(_steam_localconfigs())
+    if use_steam and steam_running():
+        raise RuntimeError("Steam 이 실행 중입니다 — 실행 옵션은 Steam 이 꺼져 있을 때만 바꿀 수 있습니다.\n"
+                           "트레이의 Steam 아이콘 우클릭 → [나가기] 로 완전히 종료한 뒤 다시 눌러 주세요.")
+    done = []
+    for f in spec["core_files"]:
+        src = mod / "libs" / f
+        if not src.is_file():
+            raise RuntimeError(f"ZombieBuddy 모드 폴더에 {f} 가 없음: {src}")
+        shutil.copy2(src, gd / f)
+    done.append("zbNative.dll · ZombieBuddy.jar 복사 (모드 " + (spec["mod_version"] or "?") + ")")
+    changed = []
+    _edit_json_vmargs(gd, lambda a: a if any(_is_zb_opt(x, arg) for x in a)
+                      else (changed.append(1) or [arg] + a))
+    if changed:
+        done.append(f"ProjectZomboid64.json 에 {arg} 추가")
+    bat = gd / "ProjectZomboid64.bat"
+    if bat.exists():
+        raw = bat.read_text(encoding="utf-8", errors="replace")
+        new, ch = _bat_zb_edit(raw, arg, True)
+        if ch:
+            bat.write_text(new, encoding="utf-8")
+            done.append(f"ProjectZomboid64.bat _JAVA_OPTIONS 에 {arg} 추가")
+    if use_steam:
+        for p in _steam_localconfigs():
+            text = p.read_text(encoding="utf-8", errors="replace")
+            cur, _ = vdf_get_launch_options(text)
+            new_opts, ch = launch_opts_add(cur or "", arg)
+            if ch:
+                _backup_localconfig(p)
+                p.write_text(vdf_set_launch_options(text, new_opts), encoding="utf-8")
+                done.append(f"Steam 실행 옵션 ({p.parent.parent.name}): {new_opts}")
+    return done
+
+
+def zb_remove(game_dir):
+    """설치기 Uninstall 과 같은 작업."""
+    gd = Path(game_dir)
+    spec = zb_spec(zb_mod_dir())
+    arg = spec["launch_arg"]
+    use_steam = is_steam_install(gd) and bool(_steam_localconfigs())
+    if use_steam and steam_running():
+        st = _steam_opts_state(arg)
+        if any(o and any(_is_zb_opt(t, arg) for t in o.split()) for _, o in st):
+            raise RuntimeError("Steam 이 실행 중입니다 — 실행 옵션은 Steam 이 꺼져 있을 때만 바꿀 수 있습니다.\n"
+                               "트레이의 Steam 아이콘 우클릭 → [나가기] 로 완전히 종료한 뒤 다시 눌러 주세요.")
+    done = []
+    changed = []
+    _edit_json_vmargs(gd, lambda a: (changed.append(1) or [x for x in a if not _is_zb_opt(x, arg)])
+                      if any(_is_zb_opt(x, arg) for x in a) else a)
+    if changed:
+        done.append(f"ProjectZomboid64.json 에서 {arg} 제거")
+    bat = gd / "ProjectZomboid64.bat"
+    if bat.exists():
+        raw = bat.read_text(encoding="utf-8", errors="replace")
+        new, ch = _bat_zb_edit(raw, arg, False)
+        if ch:
+            bat.write_text(new, encoding="utf-8")
+            done.append(f"ProjectZomboid64.bat _JAVA_OPTIONS 에서 {arg} 제거")
+    if use_steam:
+        for p in _steam_localconfigs():
+            text = p.read_text(encoding="utf-8", errors="replace")
+            cur, _ = vdf_get_launch_options(text)
+            if not cur:
+                continue
+            new_opts, ch = launch_opts_remove(cur, arg)
+            if ch:
+                _backup_localconfig(p)
+                p.write_text(vdf_set_launch_options(text, new_opts), encoding="utf-8")
+                done.append(f"Steam 실행 옵션 ({p.parent.parent.name}): '{new_opts}'")
+    for f in spec["core_files"] + ZB_EXTRA_REMOVE_FILES:
+        fp = gd / f
+        if fp.exists():
+            fp.unlink()
+            done.append(f"{f} 삭제")
+    return done
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  UI
 # ═══════════════════════════════════════════════════════════════════════════════
 DARK_QSS = """
@@ -836,6 +1262,13 @@ QCheckBox:disabled { color:#5f5e5a; }
 QLabel#muted { color:#9a9ca3; font-size:12px; }
 QLabel#hint  { color:#6f7178; font-size:11px; }
 QLabel#warn  { color:#ef9f27; font-size:11px; }
+QLabel#info  { color:#cfd0d4; font-size:13px; }
+QLabel#zbstate { color:#cfd0d4; font-size:13px; }
+QFrame#box   { background:#1b1d22; border:1px solid rgba(255,255,255,0.08); border-radius:8px; }
+QFrame#box QLabel { background:transparent; }
+QPushButton#zb { background:#2b2e36; border:1px solid #1d9e75; color:#5dcaa5; font-weight:bold; padding:7px 14px; }
+QPushButton#zb:hover { background:#343843; }
+QPushButton#zb:disabled { border:1px solid rgba(255,255,255,0.12); color:#5f5e5a; }
 QLabel#sect  { font-size:15px; font-weight:bold; color:#e8e8ea; }
 QLabel#linkok { color:#5dcaa5; font-weight:bold; }
 QLabel#err   { font-size:13px; font-weight:bold; color:#e24b4a; }
@@ -909,8 +1342,23 @@ class OptimizerWindow(QWidget):
         drow.addWidget(self.pick_btn)
         root.addLayout(drow)
 
-        self.status = self._lbl("", "hint")
+        self.info = self._lbl("", "info")          # 감지된 빌드 / 설정된 힙 (크게)
+        root.addWidget(self.info)
+        self.status = self._lbl("", "warn")        # 관리자 권한·PZ 실행 중 등 경고
         root.addWidget(self.status)
+
+        # ZombieBuddy 적용/해제 토글 (빌드 무관)
+        self.zb_box = QFrame(); self.zb_box.setObjectName("box")
+        zh = QHBoxLayout(self.zb_box); zh.setContentsMargins(12, 10, 12, 10); zh.setSpacing(10)
+        zv = QVBoxLayout(); zv.setSpacing(2)
+        self.zb_state = self._lbl("", "zbstate")
+        self.zb_detail = self._lbl("", "hint")
+        zv.addWidget(self.zb_state); zv.addWidget(self.zb_detail)
+        zh.addLayout(zv, 1)
+        self.zb_btn = QPushButton("ZombieBuddy 적용"); self.zb_btn.setObjectName("zb")
+        self.zb_btn.clicked.connect(self._zb_toggle)
+        zh.addWidget(self.zb_btn)
+        root.addWidget(self.zb_box)
 
         host = QWidget()
         lv = QVBoxLayout(host); lv.setContentsMargins(2, 2, 2, 2); lv.setSpacing(2)
@@ -973,21 +1421,28 @@ class OptimizerWindow(QWidget):
             cb.setChecked(bool(ok and opt_group_applied(g, gd)))
             cb.setText(g.label if ok else f"{g.label}  —  {why}")
 
-        msgs = []
+        info, msgs = [], []
         if gd is None:
             msgs.append("PZ 설치 폴더를 자동으로 찾지 못했습니다 — 폴더를 직접 지정해 주세요.")
         elif not valid:
             msgs.append("이 폴더에 ProjectZomboid64.json 이 없습니다 — PZ 설치 폴더가 맞는지 확인해 주세요.")
         else:
-            msgs.append(build_label(gd))
-        mb = half_ram_mb()
-        if mb > 0:
-            msgs.append(f"설정될 힙 크기: {mb:,} MB (전체 RAM {total_ram_mb():,} MB 의 절반)")
+            info.append(build_label(gd))
+            cur = _json_heap_mb(gd)
+            mb = half_ram_mb()
+            line = f"설정된 힙 크기: {cur:,} MB" if cur else "설정된 힙 크기: 알 수 없음"
+            if mb > 0 and cur != mb:
+                line += f"   (힙 항목 적용 시 {mb:,} MB — 전체 RAM {total_ram_mb():,} MB 의 절반)"
+            info.append(line)
+        self.info.setText("\n".join(info))
+        self.info.setVisible(bool(info))
         if not is_admin():
             msgs.append("관리자 권한이 아닙니다 — Program Files 아래 설치본은 적용이 실패할 수 있습니다.")
         if pz_running():
             msgs.append("Project Zomboid 실행 중 — 게임을 종료해야 파일을 바꿀 수 있습니다.")
         self.status.setText("\n".join(msgs))
+        self.status.setVisible(bool(msgs))
+        self._zb_refresh(gd if valid else None)
 
         notes = []
         info = graal_zip_info()
@@ -1000,6 +1455,66 @@ class OptimizerWindow(QWidget):
         self.graal_note.setText("     " + "\n     ".join(notes) if notes else "")
         self.empty_hint.setVisible(not valid)
         self.apply_btn.setEnabled(valid)
+
+    # --- ZombieBuddy ---
+    def _zb_refresh(self, gd):
+        self.zb_box.setVisible(gd is not None)
+        if gd is None:
+            return
+        st = zb_status(gd)
+        self._zb_st = st
+        spec, parts = st["spec"], st["parts"]
+        ver = spec["mod_version"] or "?"
+        names = {"files": "파일", "json": "json", "bat": "bat", "steam": "Steam 실행 옵션"}
+        state = st["state"]
+        if state == "applied":
+            self.zb_state.setText(f"ZombieBuddy 적용됨  ·  모드 {ver}")
+            self.zb_btn.setText("ZombieBuddy 적용 해제")
+        elif state == "outdated":
+            self.zb_state.setText(f"ZombieBuddy 적용됨 — 모드가 업데이트됨 ({ver})")
+            self.zb_btn.setText("ZombieBuddy 업데이트")
+        elif state == "partial":
+            on = ", ".join(names[k] for k, v in parts.items() if v)
+            self.zb_state.setText(f"ZombieBuddy 일부만 적용됨 ({on})")
+            self.zb_btn.setText("ZombieBuddy 적용")
+        elif state == "nomod":
+            self.zb_state.setText("ZombieBuddy 모드를 구독하지 않음")
+            self.zb_btn.setText("ZombieBuddy 적용")
+        else:
+            self.zb_state.setText(f"ZombieBuddy 미적용  ·  모드 {ver}")
+            self.zb_btn.setText("ZombieBuddy 적용")
+        detail = []
+        if not st["steam_ok"]:
+            detail.append("Steam 정식 설치 폴더가 아니라 Steam 실행 옵션은 건드리지 않습니다 (json·bat 만 적용).")
+        if zb_installer_mismatch(spec):
+            detail.append(f"⚠ ZombieBuddy 설치기가 v{spec['installer_version']} 로 바뀌었습니다 — "
+                          "설치 방식이 달라졌을 수 있으니 PZ Optimizer 업데이트를 확인하세요.")
+        self.zb_detail.setText("\n".join(detail))
+        self.zb_detail.setVisible(bool(detail))
+        self.zb_btn.setEnabled(state != "nomod" or st["mod"] is not None)
+
+    def _zb_toggle(self):
+        gd = self.game_dir
+        if gd is None or self.worker is not None:
+            return
+        if pz_running():
+            QMessageBox.information(self, APP_TITLE, "Project Zomboid가 실행 중입니다. 게임을 먼저 종료해 주세요.")
+            return
+        st = zb_status(gd)
+        removing = st["state"] == "applied"
+        try:
+            done = zb_remove(gd) if removing else zb_apply(gd)
+        except PermissionError as e:
+            QMessageBox.warning(self, APP_TITLE, f"쓰기 권한이 없습니다 — 관리자 권한으로 실행해 주세요.\n\n{e}")
+            return
+        except Exception as e:
+            QMessageBox.warning(self, APP_TITLE, f"실패: {e}")
+            self._reload_state()
+            return
+        self._reload_state()
+        title = "ZombieBuddy 적용 해제 완료" if removing else "ZombieBuddy 적용 완료"
+        QMessageBox.information(self, APP_TITLE, title + "\n\n" + ("\n".join("· " + d for d in done)
+                                                                   if done else "변경할 것이 없습니다."))
 
     def _choose_dir(self):
         start = str(self.game_dir) if self.game_dir else str(Path.home())
@@ -1019,7 +1534,7 @@ class OptimizerWindow(QWidget):
 
     # --- 적용 ---
     def _set_busy(self, busy):
-        for w in (self.apply_btn, self.close_btn, self.pick_btn, self.all_btn, self.none_btn):
+        for w in (self.apply_btn, self.close_btn, self.pick_btn, self.all_btn, self.none_btn, self.zb_btn):
             w.setEnabled(not busy)
         for cb in self.boxes.values():
             cb.setAttribute(Qt.WA_TransparentForMouseEvents, busy)
