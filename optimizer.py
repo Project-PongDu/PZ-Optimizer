@@ -50,7 +50,7 @@ from PyQt5.QtWidgets import (
 )
 
 
-VERSION = "v1.4.0"
+VERSION = "v1.4.1"
 APP_TITLE = "PZ Optimizer"
 PAGE_TITLE = "프로젝트 좀보이드 최적화 툴"
 
@@ -1448,7 +1448,7 @@ def pzopt_copy_complete(classes_dir: Path) -> bool:
 def run_pzopt_script(game_dir, uninstall=False):
     """제작자의 install.ps1 실행. 반환: (성공 여부, 출력 텍스트)."""
     if os.name != "nt":
-        raise RuntimeError("PZ_Optimization 설치 스크립트는 Windows 에서만 실행합니다.")
+        raise RuntimeError("PZ OP 적용 스크립트는 Windows 에서만 실행합니다.")
     st = pzopt_status(game_dir)
     if uninstall:
         script = None
@@ -1463,9 +1463,9 @@ def run_pzopt_script(game_dir, uninstall=False):
         args = ["-Uninstall", "-Dir", str(game_dir)]
     else:
         if st["busy"]:
-            raise RuntimeError("Steam 이 PZ_Optimization 업데이트를 받는 중입니다 — 다운로드가 끝난 뒤 다시 시도해 주세요.")
+            raise RuntimeError("Steam 이 PZ OP 업데이트를 받는 중입니다 — 다운로드가 끝난 뒤 다시 시도해 주세요.")
         if st["match"] is None:
-            raise RuntimeError(f"이 게임 버전(리비전 {st['rev'] or '?'})용 PZ_Optimization 빌드가 워크샵 폴더에 없습니다.\n"
+            raise RuntimeError(f"이 게임 버전(리비전 {st['rev'] or '?'})용 PZ OP 빌드가 워크샵 폴더에 없습니다.\n"
                                "Steam 이 모드나 게임을 업데이트 중일 수 있습니다 — 잠시 뒤 다시 시도해 주세요.")
         classes = st["match"][0]
         script = classes.parent / "install.ps1"
@@ -1550,8 +1550,7 @@ class OptimizerWindow(QWidget):
         self._root.setStretch(i, 1 if on else 0)
         self._root.setStretch(self._stretch_idx, 0 if on else 1)
         self.opt_btn.setText("일반 최적화  ▴" if on else "일반 최적화  ▾")
-        self.all_btn.setVisible(on); self.none_btn.setVisible(on)
-        self.apply_btn.setVisible(on)        # 일반 최적화 전용 버튼 — 접혀 있으면 숨김
+        self.opt_actions.setVisible(on)      # 일반 최적화 전용 버튼 — 접혀 있으면 숨김
 
     def _opt_summary(self, *_):
         shown = [g for g in OPT_GROUPS if not self.rows[g.key].isHidden() and self.boxes[g.key].isEnabled()]
@@ -1611,7 +1610,7 @@ class OptimizerWindow(QWidget):
         self.po_detail = self._lbl("", "hint")
         pv.addWidget(self.po_state); pv.addWidget(self.po_detail)
         ph.addLayout(pv, 1)
-        self.po_btn = QPushButton("PZ_Optimization 설치"); self.po_btn.setObjectName("zb")
+        self.po_btn = QPushButton("PZ OP 적용"); self.po_btn.setObjectName("zb")
         self.po_btn.clicked.connect(self._po_click)
         ph.addWidget(self.po_btn)
         root.addWidget(self.po_box)
@@ -1636,6 +1635,18 @@ class OptimizerWindow(QWidget):
         self.opt_scroll.setFrameShape(QFrame.NoFrame); self.opt_scroll.setWidget(host)
         self.opt_scroll.viewport().setObjectName("clear")
         ov.addWidget(self.opt_scroll, 1)
+        # 전체 선택/해제·적용 — 일반 최적화 전용이라 박스 안 하단에 두고, 박스를 펼쳤을 때만 보인다
+        self.opt_actions = QWidget(); self.opt_actions.setObjectName("clear")
+        ah = QHBoxLayout(self.opt_actions); ah.setContentsMargins(0, 4, 0, 0)
+        self.all_btn = QPushButton("전체 선택"); self.all_btn.setObjectName("link")
+        self.all_btn.clicked.connect(lambda: self._set_all(True))
+        self.none_btn = QPushButton("전체 해제"); self.none_btn.setObjectName("link")
+        self.none_btn.clicked.connect(lambda: self._set_all(False))
+        ah.addWidget(self.all_btn); ah.addWidget(self.none_btn); ah.addStretch(1)
+        self.apply_btn = QPushButton("적용"); self.apply_btn.setObjectName("start")
+        self.apply_btn.clicked.connect(self._apply)
+        ah.addWidget(self.apply_btn)
+        ov.addWidget(self.opt_actions)
         for g in OPT_GROUPS:
             row = QWidget(); row.setObjectName("clear")
             rv = QVBoxLayout(row); rv.setContentsMargins(0, 0, 0, 6); rv.setSpacing(2)
@@ -1665,15 +1676,7 @@ class OptimizerWindow(QWidget):
         self.prog_text.hide(); self.prog.hide()
         root.addWidget(self.prog_text); root.addWidget(self.prog)
 
-        brow = QHBoxLayout()
-        self.all_btn = QPushButton("전체 선택"); self.all_btn.setObjectName("link")
-        self.all_btn.clicked.connect(lambda: self._set_all(True))
-        self.none_btn = QPushButton("전체 해제"); self.none_btn.setObjectName("link")
-        self.none_btn.clicked.connect(lambda: self._set_all(False))
-        brow.addWidget(self.all_btn); brow.addWidget(self.none_btn); brow.addStretch(1)
-        self.apply_btn = QPushButton("적용"); self.apply_btn.setObjectName("start")
-        self.apply_btn.clicked.connect(self._apply)
-        brow.addWidget(self.apply_btn)
+        brow = QHBoxLayout(); brow.addStretch(1)
         self.close_btn = QPushButton("닫기"); self.close_btn.clicked.connect(self.close)
         brow.addWidget(self.close_btn)
         root.addLayout(brow)
@@ -1799,30 +1802,30 @@ class OptimizerWindow(QWidget):
         state = st["state"]
         detail = []
         if state == "installed":
-            self.po_state.setText(f"PZ_Optimization 설치됨  ·  {ver(inst)}")
-            self.po_btn.setText("PZ_Optimization 제거")
+            self.po_state.setText(f"PZ OP 적용됨  ·  {ver(inst)}")
+            self.po_btn.setText("PZ OP 적용 해제")
         elif state == "outdated":
-            self.po_state.setText(f"PZ_Optimization 업데이트 있음  ·  {ver(inst)} → {ver(match[1] if match else None)}")
-            self.po_btn.setText("PZ_Optimization 업데이트")
+            self.po_state.setText(f"PZ OP 업데이트 있음  ·  {ver(inst)} → {ver(match[1] if match else None)}")
+            self.po_btn.setText("PZ OP 업데이트")
         elif state == "unfinished":
-            self.po_state.setText("PZ_Optimization 설치가 중간에 멈춤")
-            self.po_btn.setText("PZ_Optimization 다시 설치")
+            self.po_state.setText("PZ OP 적용이 중간에 멈춤")
+            self.po_btn.setText("PZ OP 다시 적용")
         elif state == "mismatch":
-            self.po_state.setText("PZ_Optimization — 이 게임 버전용 빌드 없음")
-            self.po_btn.setText("PZ_Optimization 제거" if inst else "PZ_Optimization 설치")
+            self.po_state.setText("PZ OP — 이 게임 버전용 빌드 없음")
+            self.po_btn.setText("PZ OP 적용 해제" if inst else "PZ OP 적용")
             detail.append(f"게임 리비전 {st['rev'] or '?'} 용 빌드가 워크샵 폴더에 없습니다. "
-                          "모드 제작자가 새 게임 버전용 빌드를 올리고 Steam 이 받아오면 설치할 수 있습니다.")
+                          "모드 제작자가 새 게임 버전용 빌드를 올리고 Steam 이 받아오면 적용할 수 있습니다.")
         elif state == "nomod":
-            self.po_state.setText("PZ_Optimization 모드를 구독하지 않음")
-            self.po_btn.setText("PZ_Optimization 설치")
-            detail.append("창작마당에서 PZ_Optimization 을 구독하면 여기서 설치할 수 있습니다.")
+            self.po_state.setText("PZ OP 모드를 구독하지 않음")
+            self.po_btn.setText("PZ OP 적용")
+            detail.append("창작마당에서 PZ_Optimization 모드를 구독하면 여기서 적용할 수 있습니다.")
         else:
-            self.po_state.setText(f"PZ_Optimization 미설치  ·  워크샵 {ver(match[1] if match else None)}")
-            self.po_btn.setText("PZ_Optimization 설치")
+            self.po_state.setText(f"PZ OP 미적용  ·  워크샵 {ver(match[1] if match else None)}")
+            self.po_btn.setText("PZ OP 적용")
         if state in ("installed", "outdated", "none", "unfinished"):
             detail.append("힙·GC·JIT 를 바꾸는 이 모드의 게임 내 설정은 위 힙/GraalVM 항목과 겹칩니다 — 한쪽만 쓰세요.")
         if st["busy"]:
-            detail.append("Steam 이 PZ_Optimization 업데이트를 받는 중입니다 — 끝나면 다시 열어 주세요.")
+            detail.append("Steam 이 PZ OP 업데이트를 받는 중입니다 — 끝나면 다시 열어 주세요.")
         self.po_detail.setText("\n".join(detail))
         self.po_detail.setVisible(bool(detail))
         can = (state in ("installed", "outdated", "unfinished", "none")
@@ -1840,15 +1843,15 @@ class OptimizerWindow(QWidget):
             return
         st = pzopt_status(gd)
         uninstall = st["state"] == "installed" or (st["state"] == "mismatch" and st["installed"])
-        what = "제거" if uninstall else ("업데이트" if st["state"] == "outdated" else "설치")
+        what = "적용 해제" if uninstall else ("업데이트" if st["state"] == "outdated" else "적용")
         if not uninstall and QMessageBox.question(
                 self, APP_TITLE,
-                "PZ_Optimization 은 게임 엔진 class 약 1,100개를 게임 폴더에 넣는 모드입니다.\n"
+                "PZ OP(PZ_Optimization 모드)는 게임 엔진 class 약 1,100개를 게임 폴더에 넣는 모드입니다.\n"
                 "제작자가 다른 모드·멀티플레이와의 호환을 보장하지 않습니다.\n\n"
                 f"{what}할까요? (모드에 포함된 제작자의 설치 스크립트를 실행합니다)") != QMessageBox.Yes:
             return
         self._set_busy(True)
-        self.prog.setRange(0, 0); self.prog_text.setText(f"PZ_Optimization {what} 중… (1분 정도 걸릴 수 있습니다)")
+        self.prog.setRange(0, 0); self.prog_text.setText(f"PZ OP {what} 중… (1분 정도 걸릴 수 있습니다)")
         self.worker = TaskWorker(lambda: run_pzopt_script(gd, uninstall=uninstall))
         self.worker.done.connect(lambda res: self._po_done(what, res))
         self.worker.failed.connect(self._on_failed)
@@ -1860,9 +1863,9 @@ class OptimizerWindow(QWidget):
         self._finish()
         tail = "\n".join(out.splitlines()[-12:])
         if ok:
-            QMessageBox.information(self, APP_TITLE, f"PZ_Optimization {what} 완료\n\n{tail}")
+            QMessageBox.information(self, APP_TITLE, f"PZ OP {what} 완료\n\n{tail}")
         else:
-            QMessageBox.warning(self, APP_TITLE, f"PZ_Optimization {what} 실패\n\n{tail}")
+            QMessageBox.warning(self, APP_TITLE, f"PZ OP {what} 실패\n\n{tail}")
 
     def _zb_toggle(self):
         gd = self.game_dir
