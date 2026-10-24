@@ -50,7 +50,7 @@ from PyQt5.QtWidgets import (
 )
 
 
-VERSION = "v1.1.0"
+VERSION = "v1.2.0"
 APP_TITLE = "PZ Optimizer"
 PAGE_TITLE = "프로젝트 좀보이드 최적화 툴"
 
@@ -70,7 +70,7 @@ GRAAL_ZIP_NAME = "graalvm-jdk-25_windows-x64_bin.zip"   # Oracle 공식 zip 원�
 OPT_BACKUP_DIRNAME = "puppet_opt_backup"        # 런처 시절과 같은 이름 — 기존 백업 그대로 이어씀
 STATE_FILE = "pongdu_opt_state.json"            # 퐁듀 런처가 읽는 적용 상태 기록
 PZ_APPID = "108600"
-ICON_FILE = "pongdu.ico"
+ICON_FILE = "optimizer.ico"
 
 GRAAL_VMARGS = ["-XX:+AlwaysPreTouch", "-Djdk.graal.CompilerConfiguration=enterprise"]
 JRE_TMP_DIRNAME = "jre64.__pzopt_tmp"           # 압축 해제 임시 폴더 (끝나면 jre64 로 이름 변경)
@@ -312,10 +312,18 @@ def vanilla_release(game_dir: Path) -> dict:
     return bk or read_release(game_dir / "jre64")
 
 
+BUILD_BY_JAVA = {17: "b41", 25: "b42"}      # 번들 JRE 의 Java 메이저 버전 → PZ 빌드
+
+
+def detect_build(game_dir: Path):
+    """'b41' | 'b42' | None(알 수 없음). jre64 가 Graal 로 바뀌어 있어도 원본(백업) 기준."""
+    return BUILD_BY_JAVA.get(java_major(vanilla_release(game_dir)))
+
+
 def build_label(game_dir: Path) -> str:
     rel = vanilla_release(game_dir)
     major = java_major(rel)
-    name = {17: "B41", 25: "B42"}.get(major, "알 수 없는 빌드")
+    name = {"b41": "B41", "b42": "B42"}.get(BUILD_BY_JAVA.get(major), "알 수 없는 빌드")
     jre = {"graal": "GraalVM " + read_release(game_dir / "jre64").get("GRAALVM_VERSION", ""),
            "vanilla": "원본", "mixed": "섞임 (재적용 필요)", "missing": "없음"}[jre_state(game_dir)]
     return f"감지된 빌드: {name} (Java {major or '?'})  ·  현재 JRE: {jre}"
@@ -362,27 +370,28 @@ def graal_zip_info():
 # label : 체크박스 표시명
 # files : 게임 폴더 기준 상대경로. class/heap 은 백업 대상이기도 하다 (그룹 내 전부 함께 움직임).
 #         IsoWorld$* 는 IsoWorld 내부 클래스라 버전이 서로 맞아야 해서 한 그룹으로 묶는다.
-OptGroup = namedtuple("OptGroup", "key kind label files")
+# builds: 화면에 보여줄 빌드. 선택한 설치본의 빌드에 해당하는 항목만 목록에 나온다.
+OptGroup = namedtuple("OptGroup", "key kind label files builds")
 
 OPT_GROUPS = [
-    OptGroup("chunk", "class", "청크 로딩 최적화  [B41]",
-             ["zombie/iso/IsoChunkMap.class"]),
-    OptGroup("world", "class", "월드 업데이트 / 좀비 정렬 연산 최적화  [B41]",
+    OptGroup("chunk", "class", "청크 로딩 최적화",
+             ["zombie/iso/IsoChunkMap.class"], ("b41",)),
+    OptGroup("world", "class", "월드 업데이트 / 좀비 정렬 연산 최적화",
              ["zombie/iso/IsoWorld.class",
               "zombie/iso/IsoWorld$CompDistToPlayer.class",
               "zombie/iso/IsoWorld$CompScoreToPlayer.class",
               "zombie/iso/IsoWorld$Frame.class",
               "zombie/iso/IsoWorld$MetaCell.class",
-              "zombie/iso/IsoWorld$s_performance.class"]),
-    OptGroup("netzombie", "class", "좀비 네트워크 패킷 최적화  [B41]",
-             ["zombie/popman/NetworkZombiePacker.class"]),
-    OptGroup("zcount", "class", "좀비 개체수 연산 최적화  [B41]",
-             ["zombie/popman/ZombieCountOptimiser.class"]),
-    OptGroup("heap", "heap", "JVM 힙 메모리 = 전체 RAM 의 절반  [B41·B42]",
-             ["ProjectZomboid64.json", "ProjectZomboid64.bat"]),
-    OptGroup("graal", "graal", "JVM 교체: Oracle GraalVM + AlwaysPreTouch  [B42]",
+              "zombie/iso/IsoWorld$s_performance.class"], ("b41",)),
+    OptGroup("netzombie", "class", "좀비 네트워크 패킷 최적화",
+             ["zombie/popman/NetworkZombiePacker.class"], ("b41",)),
+    OptGroup("zcount", "class", "좀비 개체수 연산 최적화",
+             ["zombie/popman/ZombieCountOptimiser.class"], ("b41",)),
+    OptGroup("heap", "heap", "JVM 힙 메모리 = 전체 RAM 의 절반",
+             ["ProjectZomboid64.json", "ProjectZomboid64.bat"], ("b41", "b42")),
+    OptGroup("graal", "graal", "JVM 교체: Oracle GraalVM + AlwaysPreTouch",
              ["jre64/  →  Oracle GraalVM (원본은 puppet_opt_backup/jre64 로 이동)",
-              "ProjectZomboid64.json / .bat  +  " + "  ".join(GRAAL_VMARGS)]),
+              "ProjectZomboid64.json / .bat  +  " + "  ".join(GRAAL_VMARGS)], ("b42",)),
 ]
 OPT_GROUP_BY_KEY = {g.key: g for g in OPT_GROUPS}
 
@@ -870,6 +879,7 @@ class OptimizerWindow(QWidget):
         self.setFixedSize(680, 720)
         self.game_dir = initial_game_dir()
         self.boxes = {}
+        self.rows = {}                 # key -> 항목 묶음 위젯 (빌드에 따라 표시/숨김)
         self.worker = None
         self._pending_update = None    # 적용 작업 중에 새 버전이 확인되면 끝난 뒤 띄운다
         self._build()
@@ -908,14 +918,19 @@ class OptimizerWindow(QWidget):
         scroll.setFrameShape(QFrame.NoFrame); scroll.setWidget(host)
         root.addWidget(scroll, 1)
         for g in OPT_GROUPS:
+            row = QWidget()
+            rv = QVBoxLayout(row); rv.setContentsMargins(0, 0, 0, 6); rv.setSpacing(2)
             cb = QCheckBox(g.label)
             self.boxes[g.key] = cb
-            lv.addWidget(cb)
-            lv.addWidget(self._lbl("     " + "\n     ".join(g.files), "hint"))
+            rv.addWidget(cb)
+            rv.addWidget(self._lbl("     " + "\n     ".join(g.files), "hint"))
             if g.kind == "graal":
                 self.graal_note = self._lbl("", "warn")
-                lv.addWidget(self.graal_note)
-            lv.addSpacing(6)
+                rv.addWidget(self.graal_note)
+            self.rows[g.key] = row
+            lv.addWidget(row)
+        self.empty_hint = self._lbl("PZ 설치 폴더를 지정하면 그 빌드에 맞는 항목이 표시됩니다.", "hint")
+        lv.addWidget(self.empty_hint)
         lv.addStretch(1)
 
         self.prog_text = self._lbl("", "muted")
@@ -947,7 +962,11 @@ class OptimizerWindow(QWidget):
         gd = self.game_dir
         self.dir_input.setText(str(gd) if gd else "")
         valid = gd is not None and is_pz_dir(gd)
+        build = detect_build(gd) if valid else None
         for g in OPT_GROUPS:
+            # 설치본 빌드에 해당하는 항목만 보인다. 빌드를 판별 못 하면(새 Java 버전 등) 전부 보여
+            # 비활성 사유로 판단하게 한다. 폴더가 없으면 아무것도 안 보인다.
+            self.rows[g.key].setVisible(valid and (build is None or build in g.builds))
             cb = self.boxes[g.key]
             ok, why = opt_group_available(g, gd if valid else None)
             cb.setEnabled(ok)
@@ -979,6 +998,7 @@ class OptimizerWindow(QWidget):
             notes.append("RAM 32GB 미만 — AlwaysPreTouch 는 시작하자마자 힙 전체를 실제 메모리로 "
                          "점유하므로 방송 프로그램과 함께 쓰면 버벅일 수 있습니다.")
         self.graal_note.setText("     " + "\n     ".join(notes) if notes else "")
+        self.empty_hint.setVisible(not valid)
         self.apply_btn.setEnabled(valid)
 
     def _choose_dir(self):
