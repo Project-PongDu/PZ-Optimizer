@@ -50,7 +50,7 @@ from PyQt5.QtWidgets import (
 )
 
 
-VERSION = "v1.4.1"
+VERSION = "v1.5.0"
 APP_TITLE = "PZ Optimizer"
 PAGE_TITLE = "프로젝트 좀보이드 최적화 툴"
 
@@ -1478,6 +1478,187 @@ def run_pzopt_script(game_dir, uninstall=False):
     return r.returncode == 0, out.strip()
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  텍스쳐 최적화 (Every Texture Optimized) 적용 / 적용 해제 — B41·B42
+#
+#  opt_conf 의 class 교체와 같은 방식: exe 에 묶인 tex_conf/<빌드>/ 의 PNG 를 게임 폴더 media/textures 에
+#  직접 덮어쓴다. 사용자는 모드를 구독할 필요가 없다. tex_conf 는 빌드할 때 collect_textures.py 가
+#  개발자 PC 의 워크샵 폴더에서 모아 오고(git 에는 안 올라감), 원작 모드는 아래와 같다.
+#    B41 : 2812026801  "Every Texture Optimized - Performance mode"     → <모드>/media/textures
+#    B42 : 3119788162  "Every Texture Optimized Maximum Performance"     → <모드>/42/media/textures
+#  번들 버전은 tex_conf/info.json 의 built 값 — 적용 기록과 다르면 '업데이트'(옵티마이저가 새 텍스쳐를 담아 나옴).
+#  원본은 puppet_opt_backup/textures/orig/ 에 보관, 기록은 puppet_opt_backup/textures/manifest.json
+#    files: {상대경로: {"sha", "size", "added", "src_size", "src_mtime"}}
+#      added = 게임에 원래 없던 파일 (해제 시 삭제)
+#  상태 판정은 파일 크기만 본다 (2천 개를 매번 해시하지 않도록). 해시는 적용할 때만.
+#    · 게임 쪽 크기가 기록과 다름   → Steam 무결성 검사·게임 업데이트로 원본이 돌아옴 → '풀림'(다시 적용)
+#    · 번들 built 가 기록과 다름     → 옵티마이저 업데이트로 텍스쳐가 바뀜 → '업데이트'
+#  다시 적용할 때 게임 파일이 우리가 쓴 것과 다르면 그게 '새 원본'이므로 백업을 갱신한다.
+# ═══════════════════════════════════════════════════════════════════════════════
+TEX_SOURCES = {
+    "b41": ("2812026801", "Every Texture Optimized - Performance mode", "media/textures"),
+    "b42": ("3119788162", "Every Texture Optimized Maximum Performance", "42/media/textures"),
+}
+TEX_DIRNAME = "textures"          # puppet_opt_backup/textures/
+TEX_CONF_DIRNAME = "tex_conf"     # exe 에 묶인 텍스쳐 (tex_conf/b41, tex_conf/b42, tex_conf/info.json)
+
+
+def tex_bundle_info():
+    try:
+        d = json.loads(Path(resource_path(TEX_CONF_DIRNAME), "info.json").read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def tex_source_dir(build):
+    """exe 에 묶인 빌드별 텍스쳐 폴더. 빌드에 안 들어갔으면 None."""
+    if build not in TEX_SOURCES:
+        return None
+    d = Path(resource_path(TEX_CONF_DIRNAME)) / build
+    return d if d.is_dir() else None
+
+
+def _tex_files(src: Path):
+    """소스 폴더의 텍스쳐 파일 상대경로 목록 ('/' 구분)."""
+    out = []
+    for dp, _dn, fn in os.walk(src):
+        for f in fn:
+            if f.lower().endswith(".png"):
+                out.append(str((Path(dp) / f).relative_to(src)).replace("\\", "/"))
+    return sorted(out)
+
+
+def _tex_bdir(game_dir):
+    return Path(game_dir) / OPT_BACKUP_DIRNAME / TEX_DIRNAME
+
+
+def _tex_load_manifest(game_dir):
+    try:
+        d = json.loads((_tex_bdir(game_dir) / "manifest.json").read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) and isinstance(d.get("files"), dict) else None
+    except Exception:
+        return None
+
+
+def tex_status(game_dir):
+    """dict: state(nomod|none|applied|outdated|broken|unsupported), count, broken, src, build"""
+    gd = Path(game_dir)
+    build = detect_build(gd)
+    if build not in TEX_SOURCES:
+        return {"state": "unsupported", "build": build}
+    src = tex_source_dir(build)
+    man = _tex_load_manifest(gd)
+    base = {"build": build, "src": src, "count": 0, "broken": 0}
+    if man is None or not man["files"]:
+        base["state"] = "nomod" if src is None else "none"
+        if src is not None:
+            base["count"] = len(_tex_files(src))
+        return base
+    files = man["files"]
+    tex = gd / "media" / "textures"
+    broken = sum(1 for rel, r in files.items()
+                 if not (tex / rel).is_file() or (tex / rel).stat().st_size != r.get("size"))
+    bundle = str(tex_bundle_info().get("built", ""))
+    outdated = src is not None and bundle and bundle != str(man.get("bundle", ""))
+    base.update(count=len(files), broken=broken)
+    base["state"] = "broken" if broken else ("outdated" if outdated else "applied")
+    return base
+
+
+def tex_apply(game_dir, progress=lambda t, p: None):
+    gd = Path(game_dir)
+    build = detect_build(gd)
+    if build not in TEX_SOURCES:
+        raise RuntimeError("이 설치본의 빌드를 알 수 없어 텍스쳐 최적화를 적용할 수 없습니다.")
+    wid = TEX_SOURCES[build][0]
+    src = tex_source_dir(build)
+    if src is None:
+        raise RuntimeError(f"이 빌드({build.upper()})용 텍스쳐가 옵티마이저에 포함되지 않았습니다.")
+    tex = gd / "media" / "textures"
+    if not tex.is_dir():
+        raise RuntimeError(f"게임 폴더에 media/textures 가 없습니다: {tex}")
+    bdir = _tex_bdir(gd)
+    orig = bdir / "orig"
+    old = (_tex_load_manifest(gd) or {}).get("files", {})
+    rels = _tex_files(src)
+    new = {}
+    for i, rel in enumerate(rels, 1):
+        s_path, d_path = src / rel, tex / rel
+        s_sha = _sha256(s_path)
+        added = False
+        if d_path.is_file():
+            ours = rel in old and _sha256(d_path) == old[rel].get("sha")
+            if ours:
+                added = old[rel].get("added", False)
+            else:                                   # 원본(또는 게임 업데이트로 바뀐 새 원본) → 백업 갱신
+                b = orig / rel
+                b.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(d_path, b)
+        else:
+            added = True
+        d_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(s_path, d_path)
+        st = s_path.stat()
+        new[rel] = {"sha": s_sha, "size": st.st_size, "added": added}
+        if i % 25 == 0 or i == len(rels):
+            progress(f"텍스쳐 교체 중… {i:,} / {len(rels):,}", int(i * 100 / max(len(rels), 1)))
+    for rel, r in old.items():                      # 모드에서 빠진 파일은 원래대로
+        if rel not in new:
+            _tex_restore_one(gd, rel, r)
+    bdir.mkdir(parents=True, exist_ok=True)
+    (bdir / "manifest.json").write_text(json.dumps(
+        {"workshop_id": wid, "build": build, "bundle": str(tex_bundle_info().get("built", "")),
+         "time": int(time.time()), "files": new},
+        ensure_ascii=False), encoding="utf-8")
+    return len(new)
+
+
+def _tex_restore_one(gd, rel, r):
+    d_path = Path(gd) / "media" / "textures" / rel
+    b = _tex_bdir(gd) / "orig" / rel
+    ours = d_path.is_file() and _sha256(d_path) == r.get("sha")
+    if r.get("added"):
+        if ours:
+            d_path.unlink()
+    elif ours and b.is_file():
+        shutil.copy2(b, d_path)
+    # ours 가 아니면 Steam 이 이미 원본으로 되돌린 것 — 그대로 둔다
+
+
+def tex_remove(game_dir, progress=lambda t, p: None):
+    gd = Path(game_dir)
+    man = _tex_load_manifest(gd)
+    if not man:
+        return 0
+    items = list(man["files"].items())
+    for i, (rel, r) in enumerate(items, 1):
+        _tex_restore_one(gd, rel, r)
+        if i % 25 == 0 or i == len(items):
+            progress(f"원본 텍스쳐 복원 중… {i:,} / {len(items):,}", int(i * 100 / max(len(items), 1)))
+    _rmtree(_tex_bdir(gd))
+    return len(items)
+
+
+class ProgressTaskWorker(QThread):
+    """진행률을 내보내는 백그라운드 작업 (fn(progress) 형태)."""
+    progress = pyqtSignal(str, int)
+    done = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self):
+        try:
+            self.done.emit(self.fn(lambda t, p: self.progress.emit(t, p)))
+        except PermissionError as e:
+            self.failed.emit("쓰기 권한이 없습니다 — 관리자 권한으로 실행해 주세요.\n\n" + str(e))
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
 class TaskWorker(QThread):
     """임의 함수를 백그라운드에서 실행 (PowerShell 설치 스크립트 등)."""
     done = pyqtSignal(object)
@@ -1615,6 +1796,19 @@ class OptimizerWindow(QWidget):
         ph.addWidget(self.po_btn)
         root.addWidget(self.po_box)
 
+        # 텍스쳐 최적화 (Every Texture Optimized) 적용·적용 해제
+        self.tx_box = QFrame(); self.tx_box.setObjectName("box")
+        th = QHBoxLayout(self.tx_box); th.setContentsMargins(12, 10, 12, 10); th.setSpacing(10)
+        tv = QVBoxLayout(); tv.setSpacing(2)
+        self.tx_state = self._lbl("", "zbstate")
+        self.tx_detail = self._lbl("", "hint")
+        tv.addWidget(self.tx_state); tv.addWidget(self.tx_detail)
+        th.addLayout(tv, 1)
+        self.tx_btn = QPushButton("텍스쳐 최적화 적용"); self.tx_btn.setObjectName("zb")
+        self.tx_btn.clicked.connect(self._tx_click)
+        th.addWidget(self.tx_btn)
+        root.addWidget(self.tx_box)
+
         # 일반 최적화 — ZombieBuddy 박스와 같은 양식. 버튼으로 체크박스 목록을 펼치고 접는다.
         self.opt_box = QFrame(); self.opt_box.setObjectName("box")
         ov = QVBoxLayout(self.opt_box); ov.setContentsMargins(12, 10, 12, 10); ov.setSpacing(8)
@@ -1726,6 +1920,7 @@ class OptimizerWindow(QWidget):
         self.status.setVisible(bool(msgs))
         self._zb_refresh(gd if valid else None)
         self._po_refresh(gd if valid else None)
+        self._tx_refresh(gd if valid else None)
 
         notes = []
         info = graal_zip_info()
@@ -1867,6 +2062,64 @@ class OptimizerWindow(QWidget):
         else:
             QMessageBox.warning(self, APP_TITLE, f"PZ OP {what} 실패\n\n{tail}")
 
+    # --- 텍스쳐 최적화 ---
+    def _tx_refresh(self, gd):
+        if gd is None:
+            self.tx_box.setVisible(False)
+            return
+        st = tex_status(gd)
+        self.tx_box.setVisible(st["state"] != "unsupported")
+        if st["state"] == "unsupported":
+            return
+        b = st["build"]
+        tag = "B41 Performance mode" if b == "b41" else "B42 Maximum Performance"
+        state, detail = st["state"], []
+        if state == "applied":
+            self.tx_state.setText(f"텍스쳐 최적화 적용됨  ·  파일 {st['count']:,}개 ({tag})")
+            self.tx_btn.setText("텍스쳐 최적화 적용 해제")
+        elif state == "outdated":
+            self.tx_state.setText(f"텍스쳐 최적화 적용됨 — 새 텍스쳐 있음 ({tag})")
+            self.tx_btn.setText("텍스쳐 최적화 업데이트")
+        elif state == "broken":
+            self.tx_state.setText(f"텍스쳐 최적화 풀림  ·  {st['broken']:,} / {st['count']:,}개가 원본으로 돌아감")
+            self.tx_btn.setText("텍스쳐 최적화 다시 적용")
+            detail.append("PZ 업데이트나 '게임 파일 무결성 검사'로 원본 텍스쳐가 돌아왔습니다.")
+        elif state == "nomod":
+            self.tx_state.setText("텍스쳐 최적화 — 이 빌드용 텍스쳐가 포함되지 않음")
+            self.tx_btn.setText("텍스쳐 최적화 적용")
+        else:
+            self.tx_state.setText(f"텍스쳐 최적화 미적용  ·  파일 {st['count']:,}개 ({tag})")
+            self.tx_btn.setText("텍스쳐 최적화 적용")
+        if state in ("none", "applied", "outdated", "broken"):
+            detail.append("게임 폴더의 텍스쳐를 저해상도판으로 직접 바꿉니다 — 모드 구독·서버 모드 목록과 무관하게 내 PC 에만 적용됩니다.")
+        self.tx_detail.setText("\n".join(detail))
+        self.tx_detail.setVisible(bool(detail))
+        can = state in ("none", "applied", "outdated", "broken")
+        self.tx_btn.setEnabled(can and self.worker is None)
+
+    def _tx_click(self):
+        gd = self.game_dir
+        if gd is None or self.worker is not None:
+            return
+        if pz_running():
+            QMessageBox.information(self, APP_TITLE, "Project Zomboid가 실행 중입니다. 게임을 먼저 종료해 주세요.")
+            return
+        st = tex_status(gd)
+        removing = st["state"] == "applied"
+        what = "적용 해제" if removing else ("업데이트" if st["state"] == "outdated" else "적용")
+        self._set_busy(True)
+        self.prog.setValue(0); self.prog_text.setText(f"텍스쳐 최적화 {what} 준비 중…")
+        fn = (lambda prog: tex_remove(gd, prog)) if removing else (lambda prog: tex_apply(gd, prog))
+        self.worker = ProgressTaskWorker(fn)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.done.connect(lambda n: self._tx_done(what, n))
+        self.worker.failed.connect(self._on_failed)
+        self.worker.start()
+
+    def _tx_done(self, what, n):
+        self._finish()
+        QMessageBox.information(self, APP_TITLE, f"텍스쳐 최적화 {what} 완료\n\n파일 {n:,}개")
+
     def _zb_toggle(self):
         gd = self.game_dir
         if gd is None or self.worker is not None:
@@ -1909,7 +2162,7 @@ class OptimizerWindow(QWidget):
     # --- 적용 ---
     def _set_busy(self, busy):
         for w in (self.apply_btn, self.close_btn, self.pick_btn, self.all_btn, self.none_btn, self.zb_btn,
-                  self.po_btn):
+                  self.po_btn, self.tx_btn):
             w.setEnabled(not busy)
         for cb in self.boxes.values():
             cb.setAttribute(Qt.WA_TransparentForMouseEvents, busy)

@@ -9,6 +9,7 @@ Project Zomboid 설치 폴더 최적화 도구. 퐁듀 런처에 있던 '게임 
 | 청크 로딩 / 월드 업데이트 / 좀비 네트워크 / 좀비 개체수 | B41 | `zombie/**.class` 패치본으로 교체 (`opt_conf/`) |
 | JVM 힙 = RAM 절반 | B41·B42 | `ProjectZomboid64.json`·`.bat` 의 `-Xms`/`-Xmx` |
 | JVM 교체 (GraalVM) | B42 (Java 25) | `jre64/` → Oracle GraalVM, `-XX:+AlwaysPreTouch` `-Djdk.graal.CompilerConfiguration=enterprise` 추가 |
+| 텍스쳐 최적화 | B41·B42 | `media/textures/**.png` 를 exe 에 묶인 저해상도본(`tex_conf/`)으로 교체 — 모드 구독 불필요 |
 
 - 원본은 게임 폴더 `puppet_opt_backup/` 에 보관. 체크 해제 = 원본 복원.
 - `jre64` 는 복사하지 않고 `puppet_opt_backup/jre64` 로 이름만 옮긴다.
@@ -18,10 +19,13 @@ Project Zomboid 설치 폴더 최적화 도구. 퐁듀 런처에 있던 '게임 
 ## 빌드
 
 1. Oracle GraalVM for JDK 25 (LTS) Windows x64 zip 을 받아 **수정 없이** `build.bat` 옆에 둔다 (git 에는 안 올라감).
-2. `build.bat` 실행 → `dist/PZ-Optimizer.exe`
-3. `dist/version.json` 의 `notes` 채우기
-4. GitHub 릴리스 생성 — 태그는 `optimizer.py` 의 `VERSION` 과 똑같이 (예: `v1.1.0`)
-5. `dist/PZ-Optimizer.exe` 와 `dist/version.json` 을 둘 다 asset 으로 첨부
+2. 빌드하는 PC 에서 워크샵 `2812026801`(B41)·`3119788162`(B42) Every Texture Optimized 를 구독해 둔다.
+   `build.bat` 이 `collect_textures.py` 로 PNG 를 `tex_conf/` 에 모아 exe 에 넣는다 (git 에는 안 올라감).
+   모은 텍스쳐 내용이 바뀌면 `tex_conf/info.json` 의 `built` 가 갱신돼 사용자 쪽에 '업데이트'로 뜬다.
+3. `build.bat` 실행 → `dist/PZ-Optimizer.exe`
+4. `dist/version.json` 의 `notes` 채우기
+5. GitHub 릴리스 생성 — 태그는 `optimizer.py` 의 `VERSION` 과 똑같이 (예: `v1.1.0`)
+6. `dist/PZ-Optimizer.exe` 와 `dist/version.json` 을 둘 다 asset 으로 첨부
 
 ## 자동 업데이트
 
@@ -39,3 +43,5 @@ Project Zomboid 설치 폴더 최적화 도구. 퐁듀 런처에 있던 '게임 
 
 Oracle GraalVM 은 GraalVM Free Terms and Conditions(GFTC) 로 배포된다 — 무료 재배포 허용, 유료 배포 불가.
 zip 은 Oracle 원본 그대로 넣고, 압축 해제한 폴더에 Oracle 의 `LICENSE.txt` 가 함께 들어간다.
+
+Every Texture Optimized 텍스쳐는 원작자(워크샵 2812026801 / 3119788162) 의 저작물이다. 공개 배포 전에 원작자 허락을 받을 것.

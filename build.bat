@@ -41,9 +41,21 @@ py -m pip install --upgrade pyinstaller
 if errorlevel 1 goto :pipfail
 echo.
 
+echo [2.5/5] Collecting texture optimization files ^(Every Texture Optimized, from your Steam Workshop^)...
+REM Copies the PNGs of the two Workshop items into tex_conf\ so they ship inside the exe like opt_conf\.
+REM You (the builder) must be subscribed to both; players are not. tex_conf\ is not in git.
+py collect_textures.py
+if errorlevel 1 (
+    echo.
+    echo [!] Could not collect textures. Subscribe to Workshop items 2812026801 and 3119788162 and let Steam download them.
+    pause
+    exit /b 1
+)
+echo.
+
 echo [3/5] Building exe... ^(the GraalVM zip makes this take a while^)
 REM --uac-admin : always run elevated (game folder is often under Program Files)
-py -m PyInstaller --onefile --noconsole --uac-admin --name PZ-Optimizer --icon=optimizer.ico --add-data "optimizer.ico;." --add-data "opt_conf;opt_conf" --add-data "graalvm-jdk-25_windows-x64_bin.zip;." optimizer.py
+py -m PyInstaller --onefile --noconsole --uac-admin --name PZ-Optimizer --icon=optimizer.ico --add-data "optimizer.ico;." --add-data "opt_conf;opt_conf" --add-data "tex_conf;tex_conf" --add-data "graalvm-jdk-25_windows-x64_bin.zip;." optimizer.py
 if errorlevel 1 (
     echo.
     echo [!] Build failed. Copy the red error above and ask about it.

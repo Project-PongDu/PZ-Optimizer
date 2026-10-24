@@ -10,3 +10,6 @@ graalvm-jdk-*.zip
 
 __pycache__/
 *.pyc
+
+# 텍스쳐 최적화 PNG (빌드 때 collect_textures.py 가 워크샵에서 모아 옴, exe 에만 묶임)
+/tex_conf/
