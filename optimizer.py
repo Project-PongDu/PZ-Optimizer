@@ -22,7 +22,11 @@ GraalVM(수백 MB)을 묶어도 런처 시작 속도·자동 업데이트 용량
     · pongdu_opt_state.json : 적용된 항목의 지문(class sha256, 힙 크기, GraalVM 버전·인자).
       퐁듀 런처가 이 파일만 읽어서 'PZ 업데이트로 최적화가 풀렸는지'를 표시한다.
 
+자동 업데이트: 런처와 같은 방식. GitHub Releases 의 version.json 을 보고 새 버전이면
+    다이얼로그 → [지금 업데이트] 시 같은 폴더에 .new 로 받아 sha256 검증 후 자기 교체·재실행.
+
 빌드: build.bat (PyInstaller --onefile --uac-admin → 항상 관리자 권한으로 실행)
+      → make_version.py 가 dist/version.json 생성 (릴리스에 exe 와 함께 첨부)
 """
 
 import hashlib
@@ -32,21 +36,34 @@ import re
 import shutil
 import stat
 import sys
+import threading
 import time
 import zipfile
 from collections import namedtuple
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QIcon, QPixmap
+from PyQt5.QtCore import Qt, QObject, QThread, QTimer, pyqtSignal
+from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QLineEdit, QPushButton, QVBoxLayout, QHBoxLayout,
-    QFileDialog, QFrame, QCheckBox, QMessageBox, QScrollArea, QProgressBar,
+    QFileDialog, QFrame, QCheckBox, QMessageBox, QScrollArea, QProgressBar, QDialog, QTextEdit,
 )
 
 
-VERSION = "v1.0.0"
+VERSION = "v1.1.0"
 APP_TITLE = "PZ Optimizer"
+PAGE_TITLE = "프로젝트 좀보이드 최적화 툴"
+
+# ── 자동 업데이트 (런처와 같은 구조) ──────────────────────────────────────────
+# 릴리즈마다 asset 두 개: PZ-Optimizer.exe + version.json (build.bat 의 make_version.py 가 생성)
+# version.json: {"version", "url", "sha256", "notes", "min_supported"(선택)}
+UPDATE_MANIFEST_URL = "https://github.com/Project-PongDu/PZ-Optimizer/releases/latest/download/version.json"
+UPDATE_TIMEOUT      = 10.0    # 매니페스트 조회 한도 (초). 실패는 조용히 무시
+UPDATE_DL_TIMEOUT   = 60.0    # exe 다운로드 소켓 타임아웃 (초)
+# 다운로드 허용 호스트. 리다이렉트를 따라간 뒤 최종 URL 도 이 목록으로 재검증한다.
+UPDATE_ALLOWED_HOSTS = ("github.com", "objects.githubusercontent.com",
+                        "release-assets.githubusercontent.com")
+IS_FROZEN = bool(getattr(sys, "frozen", False))
 
 OPT_DIRNAME = "opt_conf"                        # 패치 class 묶음 (exe 에 --add-data 로 포함)
 GRAAL_ZIP_NAME = "graalvm-jdk-25_windows-x64_bin.zip"   # Oracle 공식 zip 원본 그대로 포함
@@ -810,9 +827,10 @@ QCheckBox:disabled { color:#5f5e5a; }
 QLabel#muted { color:#9a9ca3; font-size:12px; }
 QLabel#hint  { color:#6f7178; font-size:11px; }
 QLabel#warn  { color:#ef9f27; font-size:11px; }
-QLabel#brand { font-size:13px; font-weight:bold; color:#e8e8ea; }
-QLabel#ver   { color:#6f7178; font-size:11px; }
 QLabel#sect  { font-size:15px; font-weight:bold; color:#e8e8ea; }
+QLabel#linkok { color:#5dcaa5; font-weight:bold; }
+QLabel#err   { font-size:13px; font-weight:bold; color:#e24b4a; }
+QTextEdit { background:#15171b; border:1px solid rgba(255,255,255,0.08); border-radius:8px; color:#b8bac0; font-size:12px; }
 QProgressBar { background:#1b1d22; border:1px solid rgba(255,255,255,0.10); border-radius:5px; min-height:10px; max-height:10px; }
 QProgressBar::chunk { background:#1d9e75; border-radius:4px; }
 """
@@ -853,6 +871,7 @@ class OptimizerWindow(QWidget):
         self.game_dir = initial_game_dir()
         self.boxes = {}
         self.worker = None
+        self._pending_update = None    # 적용 작업 중에 새 버전이 확인되면 끝난 뒤 띄운다
         self._build()
         self.setStyleSheet(DARK_QSS)
         self._reload_state()
@@ -864,19 +883,7 @@ class OptimizerWindow(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 18, 18, 18); root.setSpacing(10)
 
-        head = QHBoxLayout(); head.setSpacing(8)
-        ico = resource_path(ICON_FILE)
-        if os.path.exists(ico):
-            pm = QPixmap(ico)
-            if not pm.isNull():
-                logo = QLabel()
-                logo.setPixmap(pm.scaled(28, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                head.addWidget(logo)
-        head.addWidget(self._lbl(APP_TITLE, "brand")); head.addStretch(1)
-        head.addWidget(self._lbl(VERSION, "ver"))
-        root.addLayout(head)
-
-        root.addWidget(self._lbl("게임 최적화", "sect"))
+        root.addWidget(self._lbl(PAGE_TITLE, "sect"))
         root.addWidget(self._lbl(
             "체크한 항목만 게임 파일에 적용됩니다. 원본은 게임 폴더의 "
             f"{OPT_BACKUP_DIRNAME}/ 에 백업되며, 체크를 해제하면 원본으로 되돌립니다.\n"
@@ -1025,6 +1032,16 @@ class OptimizerWindow(QWidget):
             self.worker = None
         self._set_busy(False)
         self._reload_state()
+        if self._pending_update is not None:
+            man, self._pending_update = self._pending_update, None
+            QTimer.singleShot(300, lambda: self.show_update(man))
+
+    def show_update(self, man):
+        """새 버전 다이얼로그. 파일 교체 작업 중이면(재시작이 작업을 끊으므로) 끝난 뒤로 미룬다."""
+        if self.worker is not None:
+            self._pending_update = man
+            return
+        UpdateDialog(man, self).exec_()
 
     def _on_done(self, applied, restored):
         self._finish()
@@ -1044,13 +1061,347 @@ class OptimizerWindow(QWidget):
         super().closeEvent(e)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  자동 업데이트 (퐁듀 런처와 같은 방식)
+#   실행 중인 exe 는 "삭제"는 막히지만 "이름 변경"은 허용된다:
+#     1) 새 exe 를 PZ-Optimizer.exe.new 로 받는다 (같은 폴더 — 볼륨이 달라지면 rename 이 복사가 됨)
+#     2) sha256 검증
+#     3) PZ-Optimizer.exe → .old  (실행 중이어도 성공)
+#     4) .new → PZ-Optimizer.exe
+#     5) 새 exe 를 띄우고 현재 프로세스 종료 (이미 관리자 권한이라 UAC 재확인 없음)
+#     6) 새 프로세스가 시작할 때 .old 삭제
+#   3~4 사이에서 실패하면 즉시 롤백한다.
+# ═══════════════════════════════════════════════════════════════════════════════
+def parse_version(s):
+    """'v1.2.3' → (1, 2, 3). 비교 불가능한 값이면 None."""
+    nums = re.findall(r"\d+", str(s or ""))
+    if not nums:
+        return None
+    return tuple(int(n) for n in nums[:4])
+
+
+def _update_url_ok(url) -> bool:
+    """https + 허용 호스트인지. 리다이렉트 최종 URL 도 이걸로 다시 검사한다."""
+    from urllib.parse import urlparse
+    try:
+        p = urlparse(url or "")
+    except ValueError:
+        return False
+    return p.scheme == "https" and (p.hostname or "") in UPDATE_ALLOWED_HOSTS
+
+
+def cleanup_old_exe():
+    """이전 업데이트가 남긴 .old 제거. 실패해도 무시(다음 실행 때 다시 시도)."""
+    if not IS_FROZEN:
+        return
+    old = sys.executable + ".old"
+    for _ in range(10):
+        try:
+            os.remove(old)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            time.sleep(0.3)   # 직전 프로세스가 아직 완전히 안 죽었을 수 있다
+
+
+def _fresh_instance_env():
+    """재시작용 환경변수. onefile 이 남긴 임시 압축해제 폴더(_MEIxxxx) 정보를 물려주면
+       새 exe 가 곧 지워질 구 폴더를 재사용하려다 Qt 플러그인을 못 찾는다 → 비운다."""
+    env = os.environ.copy()
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"      # PyInstaller 6.9+ 공식 방식
+    meipass = getattr(sys, "_MEIPASS", None)
+    for k in list(env):
+        if k.startswith("_PYI_") or k == "_MEIPASS2":
+            env.pop(k, None)
+        elif meipass and k.upper().startswith("QT_") and meipass.lower() in env[k].lower():
+            env.pop(k, None)
+    return env
+
+
+class UpdateWorker(QObject):
+    """매니페스트 조회 + exe 다운로드/교체를 백그라운드 스레드에서 수행.
+       조회 실패는 조용히 무시 — 오프라인이어도 도구는 그대로 써야 하므로."""
+
+    found     = pyqtSignal(dict)        # 새 버전 있음 → 매니페스트 dict
+    progress  = pyqtSignal(int, int)    # 받은 바이트, 전체 바이트(모르면 0)
+    stage     = pyqtSignal(str)         # 다운로드 이후 단계 문구
+    finished  = pyqtSignal(str)         # "" = 성공(재실행 대기), 그 외 = 에러 메시지
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    # --- 조회 ---
+    def check_async(self):
+        threading.Thread(target=self._check, daemon=True).start()
+
+    def _check(self):
+        try:
+            man = self._fetch_manifest()
+        except Exception as e:
+            print("[update] check failed: %s: %s" % (type(e).__name__, e))
+            return
+        cur = parse_version(VERSION)
+        new = parse_version(man.get("version"))
+        if not cur or not new or new <= cur:
+            return
+        if not _update_url_ok(man.get("url")) or not man.get("sha256"):
+            print("[update] manifest rejected (bad url or missing sha256)")
+            return
+        floor = parse_version(man.get("min_supported"))
+        man["_forced"] = bool(floor and cur < floor)
+        self.found.emit(man)
+
+    def _fetch_manifest(self):
+        import urllib.request
+        req = urllib.request.Request(
+            UPDATE_MANIFEST_URL,
+            headers={"User-Agent": "PZOptimizer/" + VERSION, "Cache-Control": "no-cache"})
+        with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT) as r:
+            raw = r.read(64 * 1024)
+        return json.loads(raw.decode("utf-8"))
+
+    # --- 적용 ---
+    def apply_async(self, man):
+        threading.Thread(target=self._apply, args=(man,), daemon=True).start()
+
+    def _apply(self, man):
+        if not IS_FROZEN:
+            self.finished.emit("개발 모드(python optimizer.py)에서는 자동 업데이트를 쓸 수 없습니다.")
+            return
+        exe = sys.executable
+        tmp = exe + ".new"
+        old = exe + ".old"
+        try:
+            self._download(man["url"], tmp, man["sha256"])
+        except Exception as e:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            if self._cancel:
+                self.finished.emit("취소됨")
+            else:
+                self.finished.emit("다운로드 실패: %s: %s" % (type(e).__name__, e))
+            return
+
+        # 교체 — 백신 실시간 감시가 방금 받은 exe(수백 MB)를 검사하며 잠깐 잠그면
+        # os.replace 가 수 초~수십 초 블로킹될 수 있어 단계를 명시한다.
+        self.stage.emit("설치 중… (백신 검사 중이면 잠시 걸릴 수 있습니다)")
+        try:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+            os.replace(exe, old)          # 실행 중이어도 rename 은 허용됨
+        except OSError as e:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            self.finished.emit(
+                "기존 파일을 교체할 수 없습니다 (%s).\n"
+                "프로그램을 바탕화면 등 쓰기 가능한 폴더로 옮긴 뒤 다시 시도하세요." % e)
+            return
+        try:
+            os.replace(tmp, exe)
+        except OSError as e:
+            os.replace(old, exe)          # 롤백 — exe 가 사라진 채로 끝나면 안 된다
+            self.finished.emit("교체 실패, 원래 버전으로 되돌렸습니다: %s" % e)
+            return
+        self.finished.emit("")
+
+    def _download(self, url, dest, want_sha):
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": "PZOptimizer/" + VERSION})
+        h = hashlib.sha256()
+        got = 0
+        with urllib.request.urlopen(req, timeout=UPDATE_DL_TIMEOUT) as r:
+            final = getattr(r, "url", None) or url          # 리다이렉트 최종 URL 재검증
+            if not _update_url_ok(final):
+                raise ValueError("허용되지 않은 다운로드 위치: %s" % final)
+            try:
+                total = int(r.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                total = 0
+            self.progress.emit(0, total)
+            with open(dest, "wb") as f:
+                while True:
+                    if self._cancel:
+                        raise IOError("취소됨")
+                    chunk = r.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    h.update(chunk)
+                    got += len(chunk)
+                    self.progress.emit(got, total)
+        if total and got != total:
+            raise IOError("전송이 중간에 끊겼습니다 (%d/%d bytes)" % (got, total))
+        if h.hexdigest().lower() != str(want_sha).strip().lower():
+            raise ValueError("해시 불일치 — 파일이 손상됐거나 변조됐습니다")
+
+
+class UpdateDialog(QDialog):
+    """새 버전 안내 → [지금 업데이트] 시 그 자리에서 받아 교체하고 재실행."""
+
+    def __init__(self, man, parent=None):
+        super().__init__(parent)
+        self.man = man
+        self.forced = bool(man.get("_forced"))
+        self.worker = UpdateWorker(self)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.stage.connect(self._on_stage)
+        self.worker.finished.connect(self._on_finished)
+        self._working = False
+        self.setWindowTitle(f"{APP_TITLE} 업데이트")
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        ico = resource_path(ICON_FILE)
+        if os.path.exists(ico):
+            self.setWindowIcon(QIcon(ico))
+        self.setFixedWidth(440)
+        self._build()
+        self.setStyleSheet(DARK_QSS)
+
+    def _build(self):
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 18, 20, 18); v.setSpacing(10)
+        title = QLabel("새 버전이 있습니다"); title.setObjectName("sect")
+        v.addWidget(title)
+        cur_new = QLabel("%s  →  %s" % (VERSION, self.man.get("version", "?")))
+        cur_new.setObjectName("linkok")
+        v.addWidget(cur_new)
+        notes = (self.man.get("notes") or "").strip()
+        if notes:
+            box = QTextEdit(); box.setReadOnly(True); box.setPlainText(notes)
+            box.setFixedHeight(110)
+            v.addWidget(box)
+        if self.forced:
+            warn = QLabel("이 버전은 더 이상 사용할 수 없습니다. 업데이트가 필요합니다.")
+            warn.setObjectName("err"); warn.setWordWrap(True)
+            v.addWidget(warn)
+        self.bar = QProgressBar(); self.bar.setRange(0, 100); self.bar.setValue(0)
+        self.bar.setTextVisible(False)
+        self.bar.hide()
+        v.addWidget(self.bar)
+        self.status = QLabel(""); self.status.setObjectName("muted"); self.status.setWordWrap(True)
+        v.addWidget(self.status)
+        row = QHBoxLayout(); row.addStretch(1)
+        self.later_btn = QPushButton("종료" if self.forced else "나중에")
+        self.later_btn.clicked.connect(self._later_click)
+        row.addWidget(self.later_btn)
+        self.go_btn = QPushButton("지금 업데이트"); self.go_btn.setObjectName("start")
+        self.go_btn.clicked.connect(self._go_click)
+        row.addWidget(self.go_btn)
+        v.addLayout(row)
+
+    # --- 동작 ---
+    def _close_guarded(self) -> bool:
+        """닫기 시도를 받아 실제로 닫아도 되는지 판정. 작업 중이면 취소로 전환하고 False."""
+        if self._working:
+            self.worker.cancel()
+            self.status.setText("취소하는 중…")
+            return False
+        return True
+
+    def closeEvent(self, e):
+        if self._close_guarded():
+            super().closeEvent(e)
+        else:
+            e.ignore()
+
+    def reject(self):
+        """ESC 키와 '나중에/취소' 버튼이 함께 타는 경로."""
+        if not self._close_guarded():
+            return
+        super().reject()
+        if self.forced:
+            QApplication.quit()
+            os._exit(0)      # 최소지원 미만 버전은 쓰지 못하게 바로 종료
+
+    def _later_click(self):
+        self.reject()
+
+    def _go_click(self):
+        if self._working:
+            return
+        self._working = True
+        self.go_btn.setEnabled(False)
+        self.later_btn.setText("취소")
+        self.bar.show(); self.bar.setValue(0)
+        self.status.setText("다운로드 중…")
+        # X 버튼을 setWindowFlag 로 없애지 말 것 — exec_() 모달 중 네이티브 핸들이 재생성되며
+        # 다이얼로그가 숨은 채 모달만 남는 문제가 런처에서 있었다. 닫기 차단은 가드가 담당.
+        self.worker.apply_async(self.man)
+
+    def _on_progress(self, got, total):
+        if total > 0:
+            self.bar.setRange(0, 100)
+            self.bar.setValue(int(got * 100 / total))
+            self.status.setText("다운로드 중…  %.1f / %.1f MB  (%d%%)"
+                                % (got / 1048576.0, total / 1048576.0, got * 100 // total))
+        else:
+            self.bar.setRange(0, 0)
+            self.status.setText("다운로드 중…  %.1f MB" % (got / 1048576.0,))
+
+    def _on_stage(self, text):
+        self.bar.setRange(0, 0)
+        self.status.setText(text)
+        self.later_btn.setEnabled(False)   # 파일 교체 중엔 취소해도 되돌릴 게 없다
+
+    def _on_finished(self, err):
+        self._working = False
+        if err:
+            self.bar.hide()
+            self.bar.setRange(0, 100)
+            self.go_btn.setEnabled(True)
+            self.later_btn.setEnabled(True)
+            self.later_btn.setText("종료" if self.forced else "나중에")
+            self.status.setText(err)
+            return
+        self.bar.setRange(0, 100); self.bar.setValue(100)
+        self.status.setText("업데이트 완료 — 다시 시작합니다.")
+        self.later_btn.setEnabled(False)
+        QTimer.singleShot(600, self._restart)
+
+    def _restart(self):
+        """새 exe 를 띄우고 현재 프로세스를 끝낸다."""
+        import subprocess
+        try:
+            flags = 0
+            if os.name == "nt":
+                flags = 0x00000008 | 0x08000000    # DETACHED_PROCESS | CREATE_NO_WINDOW
+            subprocess.Popen([sys.executable],
+                             cwd=os.path.dirname(sys.executable) or None,
+                             close_fds=True, creationflags=flags,
+                             env=_fresh_instance_env())
+        except Exception as e:
+            QMessageBox.warning(
+                self, "재시작 실패",
+                "업데이트는 끝났지만 자동 재시작에 실패했습니다 (%s).\n"
+                "프로그램을 직접 다시 실행해주세요." % e)
+        self.accept()
+        QApplication.quit()
+        os._exit(0)      # Qt 이벤트루프/백그라운드 스레드가 종료를 붙잡지 않게 즉시 탈출
+
+
 def main():
+    cleanup_old_exe()        # 직전 업데이트가 남긴 .old 정리
     app = QApplication(sys.argv)
     ico = resource_path(ICON_FILE)
     if os.path.exists(ico):
         app.setWindowIcon(QIcon(ico))
     w = OptimizerWindow()
     w.show()
+    # 업데이트 확인 — 창을 막지 않는다. 새 버전이 있을 때만 다이얼로그가 모달로 올라온다.
+    updater = UpdateWorker(app)
+    updater.found.connect(w.show_update)
+    if IS_FROZEN:
+        QTimer.singleShot(800, updater.check_async)
     sys.exit(app.exec_())
 
 

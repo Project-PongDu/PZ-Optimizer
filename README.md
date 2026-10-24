@@ -19,7 +19,15 @@ Project Zomboid 설치 폴더 최적화 도구. 퐁듀 런처에 있던 '게임 
 
 1. Oracle GraalVM for JDK 25 (LTS) Windows x64 zip 을 받아 **수정 없이** `build.bat` 옆에 둔다 (git 에는 안 올라감).
 2. `build.bat` 실행 → `dist/PZ-Optimizer.exe`
-3. exe 는 GitHub Release asset 으로 배포.
+3. `dist/version.json` 의 `notes` 채우기
+4. GitHub 릴리스 생성 — 태그는 `optimizer.py` 의 `VERSION` 과 똑같이 (예: `v1.1.0`)
+5. `dist/PZ-Optimizer.exe` 와 `dist/version.json` 을 둘 다 asset 으로 첨부
+
+## 자동 업데이트
+
+실행하면 `releases/latest/download/version.json` 을 조회해 새 버전이면 업데이트 창을 띄운다.
+[지금 업데이트] → 같은 폴더에 `.new` 로 받아 sha256 검증 → 자기 교체 → 재실행.
+`min_supported` 를 넣으면 그 미만 버전은 업데이트하지 않으면 실행이 종료된다.
 
 현재 포함 버전:
 
