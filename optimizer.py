@@ -50,7 +50,7 @@ from PyQt5.QtWidgets import (
 )
 
 
-VERSION = "v1.5.2"
+VERSION = "v1.6.0"
 APP_TITLE = "PZ Optimizer"
 PAGE_TITLE = "프로젝트 좀보이드 최적화 툴"
 
@@ -462,6 +462,16 @@ def _json_heap_mb(game_dir) -> int:
     return 0
 
 
+PZOPT_HEAP_MARK = "-Dpzopt.heap="   # PZ OP 가 힙을 바꿀 때 남기는 표식 (=<원래 -Xmx>,<원래 -Xms>,<PreTouch 추가 0|1>)
+
+
+def pzopt_manages_heap(game_dir) -> bool:
+    """PZ OP 의 게임 내 설정이 json 의 -Xms/-Xmx 를 관리 중인가.
+       이때 우리가 힙을 바꾸면 게임을 켤 때마다 서로 덮어쓰므로 힙 항목은 손대지 않는다.
+       (PZ OP 를 제거하면 표식의 원래 값으로 되돌려 주므로 우리 값도 돌아온다)"""
+    return any(a.startswith(PZOPT_HEAP_MARK) for a in _json_vmargs(Path(game_dir)))
+
+
 def _is_heap_arg(a) -> bool:
     return str(a).startswith("-Xms") or str(a).startswith("-Xmx")
 
@@ -531,6 +541,8 @@ def opt_group_available(g, game_dir):
     if g.kind == "heap":
         if half_ram_mb() <= 0:
             return False, "RAM 크기를 알 수 없음"
+        if pzopt_manages_heap(game_dir):
+            return False, "PZ OP 가 관리 중 (게임 내 PZ OPTIMIZATION 설정에서 변경)"
         return True, ""
     # graal
     info = graal_zip_info()
@@ -798,8 +810,17 @@ def apply_opt_selection(game_dir, keys, progress=lambda t, p: None):
 # 현재 디스크와 대조한다. 그래서 여기서 항목을 추가해도 런처 수정이 필요 없다.
 def write_state(game_dir: Path):
     groups = {}
+    try:
+        prev = json.loads((game_dir / OPT_BACKUP_DIRNAME / STATE_FILE).read_text(encoding="utf-8")).get("groups") or {}
+    except Exception:
+        prev = {}
     for g in OPT_GROUPS:
         ok, _ = opt_group_available(g, game_dir)
+        if g.kind == "heap" and not ok and g.key in prev and pzopt_manages_heap(game_dir):
+            # PZ OP 가 힙을 잡고 있는 동안엔 기존 기록을 유지한다 — PZ OP 제거 시 원래 값으로 돌아오면
+            # 런처가 다시 이 기록으로 대조한다. (런처는 표식이 있으면 힙 대조를 건너뛴다)
+            groups[g.key] = prev[g.key]
+            continue
         if not ok or not opt_group_applied(g, game_dir):
             continue
         if g.kind == "class":
@@ -1915,7 +1936,9 @@ class OptimizerWindow(QWidget):
             cur = _json_heap_mb(gd)
             mb = half_ram_mb()
             line = f"설정된 힙 크기: {cur:,} MB" if cur else "설정된 힙 크기: 알 수 없음"
-            if mb > 0 and cur != mb:
+            if pzopt_manages_heap(gd):
+                line += "   (PZ OP 가 관리 중 — 게임 내 PZ OPTIMIZATION 설정에서 변경)"
+            elif mb > 0 and cur != mb:
                 line += f"   (힙 항목 적용 시 {mb:,} MB — 전체 RAM {total_ram_mb():,} MB 의 절반)"
             info.append(line)
         self.info.setText("\n".join(info))
@@ -2044,7 +2067,7 @@ class OptimizerWindow(QWidget):
             self.po_state.setText(f"PZ OP 미적용  ·  워크샵 버전: {ws_ver(match[1] if match else None)}")
             self.po_btn.setText("PZ OP 적용")
         if state in ("installed", "outdated", "none", "unfinished"):
-            detail.append("힙·GC·JIT 를 바꾸는 이 모드의 게임 내 설정은 위 힙/GraalVM 항목과 겹칩니다 — 한쪽만 쓰세요.")
+            detail.append("이 모드의 게임 내 설정이 힙을 바꾸면 위 힙 항목은 비활성화되고 PZ OP 설정을 따릅니다.")
         if st["busy"]:
             detail.append("Steam 이 PZ OP 업데이트를 받는 중입니다 — 끝나면 다시 열어 주세요.")
         self.po_detail.setText("\n".join(detail))
