@@ -50,7 +50,7 @@ from PyQt5.QtWidgets import (
 )
 
 
-VERSION = "v2.0.0"
+VERSION = "v2.0.1"
 APP_TITLE = "PZ Optimizer"
 PAGE_TITLE = "프로젝트 좀보이드 최적화 툴"
 
@@ -1328,6 +1328,11 @@ QLabel#warn  { color:#ef9f27; font-size:11px; }
 QLabel#info  { color:#cfd0d4; font-size:13px; }
 QLabel#zbstate { color:#cfd0d4; font-size:13px; }
 QLabel#recstate { color:#e8e8ea; font-size:14px; font-weight:bold; }
+QScrollBar:vertical { background:transparent; width:8px; margin:0; }
+QScrollBar::handle:vertical { background:#3a3c42; border-radius:4px; min-height:24px; }
+QScrollBar::handle:vertical:hover { background:#4a4c52; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:transparent; }
 QFrame#box   { background:#1b1d22; border:1px solid rgba(255,255,255,0.08); border-radius:8px; }
 QFrame#box QLabel, QFrame#box QScrollArea, QFrame#box QCheckBox, QWidget#clear { background:transparent; }
 QCheckBox::indicator { width:14px; height:14px; border:1px solid #6f7178; border-radius:3px; background:#15171b; }
@@ -1707,8 +1712,9 @@ def tex_remove(game_dir, progress=lambda t, p: None):
 REC_TEX_KEY = "texture"
 
 
-def recommended_plan(game_dir):
-    """[(key, label)] — 이 설치본·이 PC 에서 권장 세트로 적용할 항목. key 는 OPT_GROUPS key 또는 REC_TEX_KEY."""
+def recommended_plan(game_dir, tex_st=None):
+    """[(key, label)] — 이 설치본·이 PC 에서 권장 세트로 적용할 항목. key 는 OPT_GROUPS key 또는 REC_TEX_KEY.
+       tex_st: 이미 구한 tex_status 결과 (텍스쳐 수천 개를 다시 검사하지 않도록)."""
     gd = Path(game_dir)
     out = []
     for g in OPT_GROUPS:
@@ -1717,14 +1723,14 @@ def recommended_plan(game_dir):
         ok, _ = opt_group_available(g, gd)
         if ok:
             out.append((g.key, g.label))
-    if tex_status(gd)["state"] not in ("unsupported", "nomod"):
+    if (tex_st or tex_status(gd))["state"] not in ("unsupported", "nomod"):
         out.append((REC_TEX_KEY, "텍스쳐 최적화"))
     return out
 
 
-def recommended_applied(game_dir, key) -> bool:
+def recommended_applied(game_dir, key, tex_st=None) -> bool:
     if key == REC_TEX_KEY:
-        return tex_status(game_dir)["state"] == "applied"
+        return (tex_st or tex_status(game_dir))["state"] == "applied"
     return opt_group_applied(OPT_GROUP_BY_KEY[key], Path(game_dir))
 
 
@@ -1835,14 +1841,16 @@ class OptimizerWindow(QWidget):
         ico = resource_path(ICON_FILE)
         if os.path.exists(ico):
             self.setWindowIcon(QIcon(ico))
-        self.setFixedSize(680, 720)
+        self.setFixedWidth(680)        # 높이는 내용(고급·일반 최적화 펼침)에 맞춰 _fit_height 가 조절
         self.game_dir = initial_game_dir()
         self.boxes = {}
         self.rows = {}                 # key -> 항목 묶음 위젯 (빌드에 따라 표시/숨김)
+        self.whys = {}                 # key -> 비활성 사유 라벨
         self.worker = None
         self._pending_update = None    # 적용 작업 중에 새 버전이 확인되면 끝난 뒤 띄운다
         self._advanced = False         # [고급] 토글 — 켜야 개별 항목 박스들이 보인다 (실행할 때마다 꺼진 채 시작)
         self._rec_all = False          # 권장 세트가 전부 적용된 상태인가 (버튼이 '해제' 로 동작)
+        self._adv_want = {}            # 고급 박스 → 고급이 켜졌을 때 보여야 하는가
         self._build()
         self.setStyleSheet(DARK_QSS)
         self._set_expanded(False)
@@ -1863,6 +1871,28 @@ class OptimizerWindow(QWidget):
         self._root.setStretch(self._stretch_idx, 0 if on else 1)
         self.opt_btn.setText("일반 최적화  ▴" if on else "일반 최적화  ▾")
         self.opt_actions.setVisible(on)      # 일반 최적화 전용 버튼 — 접혀 있으면 숨김
+        self._fit_height()
+
+    def _fit_height(self):
+        """창 높이를 지금 보이는 내용에 맞춘다. 화면보다 크면 화면 높이까지 (넘치는 건 일반 최적화 목록이 스크롤)."""
+        QTimer.singleShot(0, self._do_fit_height)
+
+    def _do_fit_height(self):
+        lay = self.layout()
+        lay.activate()
+        if self._expanded:
+            host = self.opt_scroll.widget()
+            vw = self.opt_scroll.viewport().width()
+            hh = host.heightForWidth(vw) if host.hasHeightForWidth() and vw > 0 else -1
+            self.opt_scroll.setMinimumHeight(min((hh if hh > 0 else host.sizeHint().height()) + 4, 420))
+        else:
+            self.opt_scroll.setMinimumHeight(0)
+        w = self.width()
+        h = lay.totalHeightForWidth(w) if lay.hasHeightForWidth() else lay.totalSizeHint().height()
+        sc = self.screen() if hasattr(self, "screen") else None      # Qt 5.14+
+        scr = sc.availableGeometry().height() if sc else 1000
+        self.setMinimumHeight(0)
+        self.resize(w, max(360, min(h, scr - 60)))
 
     def _opt_summary(self, *_):
         shown = [g for g in OPT_GROUPS if not self.rows[g.key].isHidden() and self.boxes[g.key].isEnabled()]
@@ -1957,6 +1987,7 @@ class OptimizerWindow(QWidget):
         host = QWidget(); host.setObjectName("clear")
         lv = QVBoxLayout(host); lv.setContentsMargins(2, 2, 2, 2); lv.setSpacing(2)
         self.opt_scroll = QScrollArea(); self.opt_scroll.setWidgetResizable(True)
+        self.opt_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.opt_scroll.setFrameShape(QFrame.NoFrame); self.opt_scroll.setWidget(host)
         self.opt_scroll.viewport().setObjectName("clear")
         ov.addWidget(self.opt_scroll, 1)
@@ -1979,6 +2010,9 @@ class OptimizerWindow(QWidget):
             self.boxes[g.key] = cb
             cb.toggled.connect(self._opt_summary)
             rv.addWidget(cb)
+            why = self._lbl("", "warn")            # 비활성 사유 — 체크박스 글자는 줄바꿈이 안 돼서 따로 둔다
+            self.whys[g.key] = why
+            rv.addWidget(self._indented(why))
             rv.addWidget(self._indented(self._lbl("\n".join(g.files), "hint")))
             if g.kind == "graal":
                 self.graal_note = self._lbl("", "hint")
@@ -2048,7 +2082,8 @@ class OptimizerWindow(QWidget):
             ok, why = opt_group_available(g, gd if valid else None)
             cb.setEnabled(ok)
             cb.setChecked(bool(ok and opt_group_applied(g, gd)))
-            cb.setText(g.label if ok else f"{g.label}  —  {why}")
+            self.whys[g.key].setText(why)
+            self.whys[g.key].setVisible(not ok)
 
         info, msgs = [], []
         if gd is None:
@@ -2075,7 +2110,7 @@ class OptimizerWindow(QWidget):
         self.status.setVisible(bool(msgs))
         self._zb_refresh(gd if valid else None)
         self._po_refresh(gd if valid else None)
-        self._tx_refresh(gd if valid else None)
+        tex_st = self._tx_refresh(gd if valid else None)
 
         info = graal_zip_info()
         self.graal_note.setText(f"포함된 GraalVM {info[1].get('GRAALVM_VERSION', '?')}"
@@ -2087,14 +2122,15 @@ class OptimizerWindow(QWidget):
                                    if low_ram else "")
         self.pretouch_note.setVisible(low_ram)
         self.empty_hint.setVisible(not valid)
-        self.opt_box.setVisible(valid and self._advanced)
-        self._rec_refresh(gd if valid else None)
+        self._adv_show(self.opt_box, valid)
+        self._rec_refresh(gd if valid else None, tex_st)
         self._opt_summary()
         self.apply_btn.setEnabled(valid)
+        self._fit_height()
 
     # --- ZombieBuddy ---
     def _zb_refresh(self, gd):
-        self.zb_box.setVisible(self._advanced and gd is not None)
+        self._adv_show(self.zb_box, gd is not None)
         if gd is None:
             return
         st = zb_status(gd)
@@ -2135,17 +2171,27 @@ class OptimizerWindow(QWidget):
 
     # --- PZ_Optimization ---
     def _set_advanced(self, on):
+        """표시만 바꾼다 — 디스크 상태는 _reload_state 때 이미 읽어 둔 걸 쓴다 (텍스쳐 수천 개 재검사 방지)."""
         self._advanced = on
-        self._reload_state()
+        for box, want in self._adv_want.items():
+            box.setVisible(on and want)
+        self._fit_height()
+
+    def _adv_show(self, box, want):
+        """고급 박스 표시 조건을 기억해 두고, 고급이 켜져 있을 때만 실제로 보인다."""
+        self._adv_want[box] = bool(want)
+        box.setVisible(self._advanced and bool(want))
 
     # --- 권장 최적화 ---
-    def _rec_refresh(self, gd):
+    def _rec_refresh(self, gd, tex_st=None):
         self.rec_box.setVisible(gd is not None)
         if gd is None:
             return
-        plan = recommended_plan(gd)
-        done = [label for key, label in plan if recommended_applied(gd, key)]
-        todo = [label for key, label in plan if not recommended_applied(gd, key)]
+        tex_st = tex_st or tex_status(gd)
+        plan = recommended_plan(gd, tex_st)
+        flags = {key: recommended_applied(gd, key, tex_st) for key, _l in plan}
+        done = [label for key, label in plan if flags[key]]
+        todo = [label for key, label in plan if not flags[key]]
         self._rec_all = bool(plan) and not todo
         if not plan:
             self.rec_state.setText("이 설치본에 적용할 수 있는 권장 최적화가 없습니다")
@@ -2194,8 +2240,8 @@ class OptimizerWindow(QWidget):
                                 if n else "변경할 항목이 없습니다.")
 
     def _po_refresh(self, gd):
-        show = self._advanced and gd is not None and detect_build(Path(gd)) == "b42"
-        self.po_box.setVisible(show)
+        show = gd is not None and detect_build(Path(gd)) == "b42"
+        self._adv_show(self.po_box, show)
         if not show:
             return
         st = pzopt_status(gd)
@@ -2292,12 +2338,12 @@ class OptimizerWindow(QWidget):
     # --- 텍스쳐 최적화 ---
     def _tx_refresh(self, gd):
         if gd is None:
-            self.tx_box.setVisible(False)
-            return
+            self._adv_show(self.tx_box, False)
+            return None
         st = tex_status(gd)
-        self.tx_box.setVisible(self._advanced and st["state"] != "unsupported")
+        self._adv_show(self.tx_box, st["state"] != "unsupported")
         if st["state"] == "unsupported":
-            return
+            return st
         b = st["build"]
         tag = "B41 Performance mode" if b == "b41" else "B42 Maximum Performance"
         state, detail = st["state"], []
@@ -2323,6 +2369,7 @@ class OptimizerWindow(QWidget):
         self.tx_detail.setVisible(bool(detail))
         can = state in ("none", "applied", "outdated", "broken")
         self.tx_btn.setEnabled(can and self.worker is None)
+        return st
 
     def _tx_click(self):
         gd = self.game_dir
