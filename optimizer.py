@@ -50,7 +50,7 @@ from PyQt5.QtWidgets import (
 )
 
 
-VERSION = "v1.6.0"
+VERSION = "v2.0.0"
 APP_TITLE = "PZ Optimizer"
 PAGE_TITLE = "프로젝트 좀보이드 최적화 툴"
 
@@ -72,10 +72,13 @@ STATE_FILE = "pongdu_opt_state.json"            # 퐁듀 런처가 읽는 적용
 PZ_APPID = "108600"
 ICON_FILE = "optimizer.ico"
 
-GRAAL_VMARGS = ["-XX:+AlwaysPreTouch", "-Djdk.graal.CompilerConfiguration=enterprise"]
+GRAAL_VMARGS = ["-Djdk.graal.CompilerConfiguration=enterprise"]
+# AlwaysPreTouch 는 v2.0.0 부터 별도 항목 — 시작 시 힙 전체를 실제 메모리로 잡으므로 RAM 32GB 이상일 때만 권장.
+# (v1.x 의 graal 항목은 두 인자를 함께 넣었다. 남아 있는 PreTouch 는 이 항목이 '적용됨'으로 이어받는다)
+VMARG_GROUP_ARGS = {"pretouch": ["-XX:+AlwaysPreTouch"]}
 JRE_TMP_DIRNAME = "jre64.__pzopt_tmp"           # 압축 해제 임시 폴더 (끝나면 jre64 로 이름 변경)
 DISK_MARGIN_MB = 512                            # 압축 해제 크기 외 여유 공간
-PRETOUCH_WARN_RAM_MB = 32 * 1024                # 이 미만이면 AlwaysPreTouch 경고 문구 표시
+PRETOUCH_WARN_RAM_MB = 32 * 1024                # 이 미만이면 AlwaysPreTouch 경고 + 권장 최적화에서 제외
 
 
 def resource_path(rel):
@@ -367,6 +370,7 @@ def graal_zip_info():
 # ── 항목 정의 ─────────────────────────────────────────────────────────────────
 # key   : 설정/상태 기록용 식별자
 # kind  : "class" = opt_conf 패치본으로 교체 / "heap" = 힙 인자 치환 / "graal" = JRE 교체 + 인자
+#         "vmarg" = JVM 인자 추가만 (VMARG_GROUP_ARGS[key])
 # label : 체크박스 표시명
 # files : 게임 폴더 기준 상대경로. class/heap 은 백업 대상이기도 하다 (그룹 내 전부 함께 움직임).
 #         IsoWorld$* 는 IsoWorld 내부 클래스라 버전이 서로 맞아야 해서 한 그룹으로 묶는다.
@@ -389,9 +393,11 @@ OPT_GROUPS = [
              ["zombie/popman/ZombieCountOptimiser.class"], ("b41",)),
     OptGroup("heap", "heap", "JVM 힙 메모리 = 전체 RAM 의 절반",
              ["ProjectZomboid64.json", "ProjectZomboid64.bat"], ("b41", "b42")),
-    OptGroup("graal", "graal", "JVM 교체: Oracle GraalVM + AlwaysPreTouch",
+    OptGroup("graal", "graal", "JVM 교체: Oracle GraalVM (enterprise JIT)",
              ["jre64/  →  Oracle GraalVM (원본은 puppet_opt_backup/jre64 로 이동)",
               "ProjectZomboid64.json / .bat  +  " + "  ".join(GRAAL_VMARGS)], ("b42",)),
+    OptGroup("pretouch", "vmarg", "JVM 메모리 미리 확보 (AlwaysPreTouch)",
+             ["ProjectZomboid64.json / .bat  +  " + "  ".join(VMARG_GROUP_ARGS["pretouch"])], ("b42",)),
 ]
 OPT_GROUP_BY_KEY = {g.key: g for g in OPT_GROUPS}
 
@@ -544,6 +550,11 @@ def opt_group_available(g, game_dir):
         if pzopt_manages_heap(game_dir):
             return False, "PZ OP 가 관리 중 (게임 내 PZ OPTIMIZATION 설정에서 변경)"
         return True, ""
+    if g.kind == "vmarg":
+        # PZ OP 의 힙 설정은 PreTouch 도 함께 다룬다(gcPreTouch) — 서로 넣고 빼지 않도록 양보
+        if pzopt_manages_heap(game_dir):
+            return False, "PZ OP 가 관리 중 (게임 내 PZ OPTIMIZATION 설정에서 변경)"
+        return True, ""
     # graal
     info = graal_zip_info()
     if info is None:
@@ -555,9 +566,11 @@ def opt_group_available(g, game_dir):
     return True, ""
 
 
-def _graal_vmargs_ok(game_dir) -> bool:
+def _graal_vmargs_ok(game_dir, want=None) -> bool:
+    """json 과 bat 의 java 실행 줄에 want(기본 GRAAL_VMARGS) 인자가 전부 있는가."""
+    want = GRAAL_VMARGS if want is None else want
     args = _json_vmargs(game_dir)
-    if not all(a in args for a in GRAAL_VMARGS):
+    if not all(a in args for a in want):
         return False
     bpath = game_dir / "ProjectZomboid64.bat"
     if bpath.exists():
@@ -566,7 +579,7 @@ def _graal_vmargs_ok(game_dir) -> bool:
         except OSError:
             return False
         for ln in _bat_java_lines(raw):
-            if not all(a in ln.split() for a in GRAAL_VMARGS):
+            if not all(a in ln.split() for a in want):
                 return False
     return True
 
@@ -603,6 +616,8 @@ def opt_group_applied(g, game_dir) -> bool:
             if not found or any(x.lower() != f"-xmx{mb}m" for x in found):
                 return False
         return True
+    if g.kind == "vmarg":
+        return _graal_vmargs_ok(game_dir, VMARG_GROUP_ARGS[g.key])
     # graal
     info = graal_zip_info()
     if info is None or jre_state(game_dir) != "graal":
@@ -614,6 +629,9 @@ def opt_group_applied(g, game_dir) -> bool:
 def opt_group_touched(g, game_dir) -> bool:
     """원본에서 조금이라도 바뀌어 있는가 (해제 시 복원 대상 판정용).
        graal 은 JRE 만 바뀌고 인자는 없는 식의 반쪽 상태가 있을 수 있어 따로 본다."""
+    if g.kind == "vmarg":
+        args = _json_vmargs(game_dir)
+        return any(a in args for a in VMARG_GROUP_ARGS[g.key])
     if g.kind != "graal":
         return opt_group_applied(g, game_dir)
     if jre_state(game_dir) in ("graal", "mixed"):
@@ -717,19 +735,11 @@ def _apply_graal(game_dir: Path, progress):
         elif jre.exists():
             _rmtree(jre)                                   # 섞인/다른 버전 Graal → 버림
         os.replace(tmp, jre)
-    _edit_json_vmargs(game_dir, lambda a: a + [x for x in GRAAL_VMARGS if x not in a])
-    bpath = game_dir / "ProjectZomboid64.bat"
-    if bpath.exists():
-        raw = bpath.read_text(encoding="utf-8", errors="replace")
-        bpath.write_text(_bat_add_args(raw, GRAAL_VMARGS), encoding="utf-8")
+    _add_vmargs(game_dir, GRAAL_VMARGS)
 
 
 def _restore_graal(game_dir: Path, progress):
-    _edit_json_vmargs(game_dir, lambda a: [x for x in a if x not in GRAAL_VMARGS])
-    bpath = game_dir / "ProjectZomboid64.bat"
-    if bpath.exists():
-        raw = bpath.read_text(encoding="utf-8", errors="replace")
-        bpath.write_text(_bat_remove_args(raw, GRAAL_VMARGS), encoding="utf-8")
+    _remove_vmargs(game_dir, GRAAL_VMARGS)
     if jre_state(game_dir) == "vanilla":
         return
     jre, bjre = game_dir / "jre64", game_dir / OPT_BACKUP_DIRNAME / "jre64"
@@ -739,6 +749,22 @@ def _restore_graal(game_dir: Path, progress):
     if jre.exists():
         _rmtree(jre)
     os.replace(bjre, jre)
+
+
+def _add_vmargs(game_dir: Path, want):
+    _edit_json_vmargs(game_dir, lambda a: a + [x for x in want if x not in a])
+    bpath = game_dir / "ProjectZomboid64.bat"
+    if bpath.exists():
+        raw = bpath.read_text(encoding="utf-8", errors="replace")
+        bpath.write_text(_bat_add_args(raw, want), encoding="utf-8")
+
+
+def _remove_vmargs(game_dir: Path, want):
+    _edit_json_vmargs(game_dir, lambda a: [x for x in a if x not in want])
+    bpath = game_dir / "ProjectZomboid64.bat"
+    if bpath.exists():
+        raw = bpath.read_text(encoding="utf-8", errors="replace")
+        bpath.write_text(_bat_remove_args(raw, want), encoding="utf-8")
 
 
 def apply_opt_group(g, game_dir, progress):
@@ -755,6 +781,8 @@ def apply_opt_group(g, game_dir, progress):
                 raise RuntimeError(f"복사 검증 실패: {fname}")
     elif g.kind == "heap":
         _apply_heap(game_dir)
+    elif g.kind == "vmarg":
+        _add_vmargs(game_dir, VMARG_GROUP_ARGS[g.key])
     else:
         _apply_graal(game_dir, progress)
 
@@ -763,6 +791,9 @@ def restore_opt_group(g, game_dir, progress):
     """원본으로 되돌린다. 백업이 없으면 RuntimeError."""
     if g.kind == "heap":
         _restore_heap(game_dir)
+        return
+    if g.kind == "vmarg":
+        _remove_vmargs(game_dir, VMARG_GROUP_ARGS[g.key])
         return
     if g.kind == "graal":
         _restore_graal(game_dir, progress)
@@ -806,7 +837,7 @@ def apply_opt_selection(game_dir, keys, progress=lambda t, p: None):
 
 
 # ── 상태 기록 (퐁듀 런처가 읽음) ──────────────────────────────────────────────
-# 런처는 그룹 key 를 몰라도 된다 — 레코드에 든 필드(files / xmx_mb / graalvm_version)만 보고
+# 런처는 그룹 key 를 몰라도 된다 — 레코드에 든 필드(files / xmx_mb / graalvm_version / vmargs)만 보고
 # 현재 디스크와 대조한다. 그래서 여기서 항목을 추가해도 런처 수정이 필요 없다.
 def write_state(game_dir: Path):
     groups = {}
@@ -816,7 +847,7 @@ def write_state(game_dir: Path):
         prev = {}
     for g in OPT_GROUPS:
         ok, _ = opt_group_available(g, game_dir)
-        if g.kind == "heap" and not ok and g.key in prev and pzopt_manages_heap(game_dir):
+        if g.kind in ("heap", "vmarg") and not ok and g.key in prev and pzopt_manages_heap(game_dir):
             # PZ OP 가 힙을 잡고 있는 동안엔 기존 기록을 유지한다 — PZ OP 제거 시 원래 값으로 돌아오면
             # 런처가 다시 이 기록으로 대조한다. (런처는 표식이 있으면 힙 대조를 건너뛴다)
             groups[g.key] = prev[g.key]
@@ -827,6 +858,8 @@ def write_state(game_dir: Path):
             groups[g.key] = {"files": {rel: _sha256(game_dir / rel) for rel in g.files}}
         elif g.kind == "heap":
             groups[g.key] = {"xmx_mb": _json_heap_mb(game_dir)}
+        elif g.kind == "vmarg":
+            groups[g.key] = {"vmargs": list(VMARG_GROUP_ARGS[g.key])}
         else:
             groups[g.key] = {
                 "graalvm_version": read_release(game_dir / "jre64").get("GRAALVM_VERSION", ""),
@@ -1294,6 +1327,7 @@ QLabel#hint  { color:#6f7178; font-size:11px; }
 QLabel#warn  { color:#ef9f27; font-size:11px; }
 QLabel#info  { color:#cfd0d4; font-size:13px; }
 QLabel#zbstate { color:#cfd0d4; font-size:13px; }
+QLabel#recstate { color:#e8e8ea; font-size:14px; font-weight:bold; }
 QFrame#box   { background:#1b1d22; border:1px solid rgba(255,255,255,0.08); border-radius:8px; }
 QFrame#box QLabel, QFrame#box QScrollArea, QFrame#box QCheckBox, QWidget#clear { background:transparent; }
 QCheckBox::indicator { width:14px; height:14px; border:1px solid #6f7178; border-radius:3px; background:#15171b; }
@@ -1662,6 +1696,79 @@ def tex_remove(game_dir, progress=lambda t, p: None):
     return len(items)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  권장 최적화 (원클릭)
+#   B41 : class 패치 4종 + 힙 + 텍스쳐
+#   B42 : 힙 + GraalVM + 텍스쳐 (+ RAM 32GB 이상이면 AlwaysPreTouch)
+#   ZombieBuddy(Steam 종료·실행 옵션 변경 필요, 단독 효과 없음)·PZ OP(모드 충돌)는 고급에서만.
+#   적용은 빠진 것만 채우고, 해제는 권장 세트에 든 항목만 되돌린다 — 고급에서 따로 켠 항목은 안 건드린다.
+#   그 빌드에서 쓸 수 없는 항목(PZ OP 가 힙 관리 중, 리소스 누락 등)은 세트에서 빠진다.
+# ═══════════════════════════════════════════════════════════════════════════════
+REC_TEX_KEY = "texture"
+
+
+def recommended_plan(game_dir):
+    """[(key, label)] — 이 설치본·이 PC 에서 권장 세트로 적용할 항목. key 는 OPT_GROUPS key 또는 REC_TEX_KEY."""
+    gd = Path(game_dir)
+    out = []
+    for g in OPT_GROUPS:
+        if g.kind == "vmarg" and g.key == "pretouch" and total_ram_mb() < PRETOUCH_WARN_RAM_MB:
+            continue
+        ok, _ = opt_group_available(g, gd)
+        if ok:
+            out.append((g.key, g.label))
+    if tex_status(gd)["state"] not in ("unsupported", "nomod"):
+        out.append((REC_TEX_KEY, "텍스쳐 최적화"))
+    return out
+
+
+def recommended_applied(game_dir, key) -> bool:
+    if key == REC_TEX_KEY:
+        return tex_status(game_dir)["state"] == "applied"
+    return opt_group_applied(OPT_GROUP_BY_KEY[key], Path(game_dir))
+
+
+def recommended_apply(game_dir, progress=lambda t, p: None):
+    """권장 세트 중 미적용(풀림·텍스쳐 업데이트 포함)만 적용. 반환: 적용한 항목 수."""
+    gd = Path(game_dir)
+    n = 0
+    try:
+        for key, label in recommended_plan(gd):
+            if recommended_applied(gd, key):
+                continue
+            progress(f"적용 중: {label}", 0)
+            if key == REC_TEX_KEY:
+                tex_apply(gd, progress)
+            else:
+                apply_opt_group(OPT_GROUP_BY_KEY[key], gd, progress)
+            n += 1
+    finally:
+        write_state(gd)
+    return n
+
+
+def recommended_remove(game_dir, progress=lambda t, p: None):
+    """권장 세트 항목만 원본으로 되돌린다. 반환: 되돌린 항목 수."""
+    gd = Path(game_dir)
+    n = 0
+    try:
+        for key, label in reversed(recommended_plan(gd)):
+            if key == REC_TEX_KEY:
+                if _tex_load_manifest(gd):
+                    progress(f"복원 중: {label}", 0)
+                    tex_remove(gd, progress)
+                    n += 1
+                continue
+            g = OPT_GROUP_BY_KEY[key]
+            if opt_group_touched(g, gd):
+                progress(f"복원 중: {label}", 0)
+                restore_opt_group(g, gd, progress)
+                n += 1
+    finally:
+        write_state(gd)
+    return n
+
+
 class ProgressTaskWorker(QThread):
     """진행률을 내보내는 백그라운드 작업 (fn(progress) 형태)."""
     progress = pyqtSignal(str, int)
@@ -1734,7 +1841,8 @@ class OptimizerWindow(QWidget):
         self.rows = {}                 # key -> 항목 묶음 위젯 (빌드에 따라 표시/숨김)
         self.worker = None
         self._pending_update = None    # 적용 작업 중에 새 버전이 확인되면 끝난 뒤 띄운다
-        self._advanced = False         # [고급] 토글 — 켜야 PZ OP 박스가 보인다 (실행할 때마다 꺼진 채 시작)
+        self._advanced = False         # [고급] 토글 — 켜야 개별 항목 박스들이 보인다 (실행할 때마다 꺼진 채 시작)
+        self._rec_all = False          # 권장 세트가 전부 적용된 상태인가 (버튼이 '해제' 로 동작)
         self._build()
         self.setStyleSheet(DARK_QSS)
         self._set_expanded(False)
@@ -1774,8 +1882,8 @@ class OptimizerWindow(QWidget):
 
         root.addWidget(self._lbl(PAGE_TITLE, "sect"))
         root.addWidget(self._lbl(
-            "체크한 항목만 게임 파일에 적용됩니다. 원본은 게임 폴더의 "
-            f"{OPT_BACKUP_DIRNAME}/ 에 백업되며, 체크를 해제하면 원본으로 되돌립니다.\n"
+            "[권장 최적화 적용] 한 번으로 이 PC·게임 빌드에 맞는 최적화를 적용합니다. 원본은 게임 폴더의 "
+            f"{OPT_BACKUP_DIRNAME}/ 에 백업되며, 해제하면 원본으로 되돌립니다.\n"
             "PZ 업데이트나 '게임 파일 무결성 검사' 후에는 최적화가 풀리므로 다시 실행해 주세요.",
             "muted"))
 
@@ -1792,6 +1900,19 @@ class OptimizerWindow(QWidget):
         root.addWidget(self.info)
         self.status = self._lbl("", "warn")        # 관리자 권한·PZ 실행 중 등 경고
         root.addWidget(self.status)
+
+        # 권장 최적화 — 기본 화면의 유일한 동작. 나머지 박스는 [고급] 을 켜야 보인다.
+        self.rec_box = QFrame(); self.rec_box.setObjectName("box")
+        rh = QHBoxLayout(self.rec_box); rh.setContentsMargins(14, 14, 14, 14); rh.setSpacing(12)
+        rv = QVBoxLayout(); rv.setSpacing(4)
+        self.rec_state = self._lbl("", "recstate")
+        self.rec_detail = self._lbl("", "hint")
+        rv.addWidget(self.rec_state); rv.addWidget(self.rec_detail)
+        rh.addLayout(rv, 1)
+        self.rec_btn = QPushButton("권장 최적화 적용"); self.rec_btn.setObjectName("start")
+        self.rec_btn.clicked.connect(self._rec_click)
+        rh.addWidget(self.rec_btn)
+        root.addWidget(self.rec_box)
 
         # ZombieBuddy 적용/해제 토글 (빌드 무관)
         self.zb_box = QFrame(); self.zb_box.setObjectName("box")
@@ -1860,8 +1981,11 @@ class OptimizerWindow(QWidget):
             rv.addWidget(cb)
             rv.addWidget(self._indented(self._lbl("\n".join(g.files), "hint")))
             if g.kind == "graal":
-                self.graal_note = self._lbl("", "warn")
+                self.graal_note = self._lbl("", "hint")
                 rv.addWidget(self._indented(self.graal_note))
+            if g.key == "pretouch":
+                self.pretouch_note = self._lbl("", "warn")
+                rv.addWidget(self._indented(self.pretouch_note))
             self.rows[g.key] = row
             lv.addWidget(row)
         lv.addStretch(1)
@@ -1897,7 +2021,7 @@ class OptimizerWindow(QWidget):
         # PZ OP 는 바닐라 클래스를 대량 교체해 다른 모드와 충돌이 잦아 기본으로 숨긴다
         self.adv_btn = QPushButton("고급"); self.adv_btn.setObjectName("adv")
         self.adv_btn.setCheckable(True)
-        self.adv_btn.setToolTip("다른 모드와 충돌할 수 있는 항목(PZ OP)을 표시합니다.")
+        self.adv_btn.setToolTip("ZombieBuddy·텍스쳐·일반 최적화·PZ OP 를 항목별로 직접 고르는 화면을 표시합니다.")
         self.adv_btn.toggled.connect(self._set_advanced)
         brow.addWidget(self.adv_btn)
         self.close_btn = QPushButton("닫기"); self.close_btn.clicked.connect(self.close)
@@ -1953,24 +2077,24 @@ class OptimizerWindow(QWidget):
         self._po_refresh(gd if valid else None)
         self._tx_refresh(gd if valid else None)
 
-        notes = []
         info = graal_zip_info()
-        if info is not None:
-            notes.append(f"포함된 GraalVM {info[1].get('GRAALVM_VERSION', '?')}"
-                         f" · 디스크 약 {info[2] // 1048576:,} MB 사용")
-        if 0 < total_ram_mb() < PRETOUCH_WARN_RAM_MB:
-            notes.append("RAM 32GB 미만 — AlwaysPreTouch 는 시작하자마자 힙 전체를 실제 메모리로 "
-                         "점유하므로 방송 프로그램과 함께 쓰면 버벅일 수 있습니다.")
-        self.graal_note.setText("\n".join(notes))
-        self.graal_note.setVisible(bool(notes))
+        self.graal_note.setText(f"포함된 GraalVM {info[1].get('GRAALVM_VERSION', '?')}"
+                                f" · 디스크 약 {info[2] // 1048576:,} MB 사용" if info is not None else "")
+        self.graal_note.setVisible(info is not None)
+        low_ram = 0 < total_ram_mb() < PRETOUCH_WARN_RAM_MB
+        self.pretouch_note.setText("RAM 32GB 미만 — 시작하자마자 힙 전체를 실제 메모리로 점유하므로 "
+                                   "방송 프로그램과 함께 쓰면 버벅일 수 있어 권장 최적화에서 제외됩니다."
+                                   if low_ram else "")
+        self.pretouch_note.setVisible(low_ram)
         self.empty_hint.setVisible(not valid)
-        self.opt_box.setVisible(valid)
+        self.opt_box.setVisible(valid and self._advanced)
+        self._rec_refresh(gd if valid else None)
         self._opt_summary()
         self.apply_btn.setEnabled(valid)
 
     # --- ZombieBuddy ---
     def _zb_refresh(self, gd):
-        self.zb_box.setVisible(gd is not None)
+        self.zb_box.setVisible(self._advanced and gd is not None)
         if gd is None:
             return
         st = zb_status(gd)
@@ -2012,8 +2136,62 @@ class OptimizerWindow(QWidget):
     # --- PZ_Optimization ---
     def _set_advanced(self, on):
         self._advanced = on
+        self._reload_state()
+
+    # --- 권장 최적화 ---
+    def _rec_refresh(self, gd):
+        self.rec_box.setVisible(gd is not None)
+        if gd is None:
+            return
+        plan = recommended_plan(gd)
+        done = [label for key, label in plan if recommended_applied(gd, key)]
+        todo = [label for key, label in plan if not recommended_applied(gd, key)]
+        self._rec_all = bool(plan) and not todo
+        if not plan:
+            self.rec_state.setText("이 설치본에 적용할 수 있는 권장 최적화가 없습니다")
+            self.rec_btn.setText("권장 최적화 적용")
+        elif not todo:
+            self.rec_state.setText(f"권장 최적화 적용됨  ·  {len(done)} / {len(plan)}")
+            self.rec_btn.setText("권장 최적화 해제")
+        elif done:
+            self.rec_state.setText(f"권장 최적화 일부 풀림  ·  {len(done)} / {len(plan)}")
+            self.rec_btn.setText("권장 최적화 적용")
+        else:
+            self.rec_state.setText("권장 최적화 미적용")
+            self.rec_btn.setText("권장 최적화 적용")
+        lines = ["포함: " + " · ".join(label for _k, label in plan)] if plan else []
+        if done and todo:
+            lines.append("적용 필요: " + " · ".join(todo))
+        lines.append("개별 항목은 [고급] 에서 고를 수 있습니다.")
+        self.rec_detail.setText("\n".join(lines))
+        self.rec_btn.setEnabled(bool(plan) and self.worker is None)
+
+    def _rec_click(self):
         gd = self.game_dir
-        self._po_refresh(gd if gd is not None and is_pz_dir(gd) else None)
+        if gd is None or self.worker is not None:
+            return
+        if pz_running():
+            QMessageBox.information(self, APP_TITLE, "Project Zomboid가 실행 중입니다. 게임을 먼저 종료해 주세요.")
+            return
+        removing = self._rec_all
+        if removing and QMessageBox.question(
+                self, APP_TITLE, "권장 최적화를 해제하고 원본으로 되돌릴까요?") != QMessageBox.Yes:
+            return
+        cfg = load_config(); cfg["pz_dir"] = str(gd); save_config(cfg)
+        what = "해제" if removing else "적용"
+        self._set_busy(True)
+        self.prog.setValue(0); self.prog_text.setText(f"권장 최적화 {what} 준비 중…")
+        fn = (lambda prog: recommended_remove(gd, prog)) if removing else (lambda prog: recommended_apply(gd, prog))
+        self.worker = ProgressTaskWorker(fn)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.done.connect(lambda n: self._rec_done(what, n))
+        self.worker.failed.connect(self._on_failed)
+        self.worker.start()
+
+    def _rec_done(self, what, n):
+        self._finish()
+        QMessageBox.information(self, APP_TITLE, f"권장 최적화 {what} 완료\n\n{n}개 항목"
+                                if n else "변경할 항목이 없습니다.")
 
     def _po_refresh(self, gd):
         show = self._advanced and gd is not None and detect_build(Path(gd)) == "b42"
@@ -2117,7 +2295,7 @@ class OptimizerWindow(QWidget):
             self.tx_box.setVisible(False)
             return
         st = tex_status(gd)
-        self.tx_box.setVisible(st["state"] != "unsupported")
+        self.tx_box.setVisible(self._advanced and st["state"] != "unsupported")
         if st["state"] == "unsupported":
             return
         b = st["build"]
@@ -2211,7 +2389,7 @@ class OptimizerWindow(QWidget):
     # --- 적용 ---
     def _set_busy(self, busy):
         for w in (self.apply_btn, self.close_btn, self.pick_btn, self.all_btn, self.none_btn, self.zb_btn,
-                  self.po_btn, self.tx_btn):
+                  self.po_btn, self.tx_btn, self.rec_btn):
             w.setEnabled(not busy)
         for cb in self.boxes.values():
             cb.setAttribute(Qt.WA_TransparentForMouseEvents, busy)
