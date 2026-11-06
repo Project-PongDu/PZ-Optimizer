@@ -43,14 +43,14 @@ from collections import namedtuple
 from pathlib import Path
 
 from PyQt5.QtCore import Qt, QEvent, QObject, QThread, QTimer, pyqtSignal
-from PyQt5.QtGui import QIcon
+from PyQt5.QtGui import QIcon, QImage, QPainter
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QLabel, QLineEdit, QPushButton, QVBoxLayout, QHBoxLayout, QLayout,
+    QApplication, QWidget, QLabel, QLineEdit, QPushButton, QVBoxLayout, QHBoxLayout, QLayout, QAbstractButton,
     QFileDialog, QFrame, QCheckBox, QMessageBox, QScrollArea, QProgressBar, QDialog, QTextEdit,
 )
 
 
-VERSION = "v2.1.3"
+VERSION = "v2.1.7"
 APP_TITLE = "PZ Optimizer"
 PAGE_TITLE = "프로젝트 좀보이드 최적화 툴"
 
@@ -1980,6 +1980,46 @@ class OptimizerWindow(QWidget):
             self._native_bg_set = True
             set_native_window_bg(int(self.winId()), (0x23, 0x25, 0x2b))   # DARK_QSS 의 QWidget 배경색
             self._fit_height()                 # 표시하면서 Qt 가 sizeHint 로 바꾼 높이를 바로잡는다
+            self._warm_glyphs()
+
+    def _warm_glyphs(self):
+        """창 안 모든 글자를 화면과 같은 형식(불투명 RGB32·같은 배율)의 이미지에 한 번 찍어 글리프 캐시를 채운다.
+           [고급] 박스를 처음 펼칠 때 한글 글리프를 그 자리에서 래스터화하느라 첫 그리기가 ~50ms 걸리고,
+           그동안 커진 창이 빈 채로 보여 흰 띠가 났다 (실측: 같은 박스가 두 번째엔 ~7ms).
+           위젯은 건드리지 않고 별도 이미지에만 그리므로 레이아웃·창 크기에 영향 없음.
+           grab() 은 투명 픽스맵이라 다른 글리프 형식(흑백 AA)이 캐시돼 화면 쪽엔 효과가 없었다."""
+        t0 = time.perf_counter()
+        chars = {}                       # font.key() -> (QFont, set(글자))
+        for w in self.findChildren(QWidget):
+            if not isinstance(w, (QLabel, QAbstractButton, QLineEdit)):
+                continue
+            try:
+                txt = w.text()
+            except Exception:
+                continue
+            if not txt:
+                continue
+            w.ensurePolished()
+            f = w.font()
+            ent = chars.setdefault(f.key(), (f, set()))
+            ent[1].update(ch for ch in txt if not ch.isspace())
+        dpr = self.devicePixelRatioF()
+        img = QImage(int(4000 * dpr), int(60 * dpr), QImage.Format_RGB32)
+        img.setDevicePixelRatio(dpr)
+        img.fill(0x23252b)
+        p = QPainter(img)
+        n = 0
+        try:
+            p.setPen(Qt.white)
+            for f, cs in chars.values():
+                p.setFont(f)
+                line = "".join(sorted(cs))
+                for i in range(0, len(line), 120):          # 한 줄이 이미지 밖으로 나가 잘리지 않게 나눠 찍는다
+                    p.drawText(4, 40, line[i:i + 120])
+                    n += len(line[i:i + 120])
+        finally:
+            p.end()
+        print(f"[PZOpt] glyph warm-up: {n} glyphs in {len(chars)} fonts, {(time.perf_counter() - t0) * 1000:.0f} ms")
 
     def _set_expanded(self, on):
         self.setUpdatesEnabled(False)        # 창 크기를 맞출 때까지 중간 화면을 그리지 않는다 (_fit_height 가 다시 켬)
@@ -2266,6 +2306,8 @@ class OptimizerWindow(QWidget):
         self._opt_summary()
         self.apply_btn.setEnabled(valid)
         self._fit_height()
+        if self.isVisible():
+            self._warm_glyphs()              # 상태 문구가 바뀌어 새 글자가 생겼을 수 있음 (이미 캐시된 글자는 금방 지나감)
 
     # --- ZombieBuddy ---
     def _zb_refresh(self, gd):
