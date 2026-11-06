@@ -50,7 +50,7 @@ from PyQt5.QtWidgets import (
 )
 
 
-VERSION = "v2.0.2"
+VERSION = "v2.1.0"
 APP_TITLE = "PZ Optimizer"
 PAGE_TITLE = "프로젝트 좀보이드 최적화 툴"
 
@@ -1372,23 +1372,26 @@ QProgressBar::chunk { background:#1d9e75; border-radius:4px; }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  PZ_Optimization (xD3I, 창작마당 3805285544) 설치·업데이트·제거 — B42 전용
+#  PZ_Optimization (xD3I) 설치·업데이트·제거 — B42 전용
 #
-#  이 모드는 '구독만으로 안 되는' 수동 설치 모드다: 엔진 class ~1100개를 게임 폴더에 풀어 넣는다.
-#  설치·제거 로직은 우리가 다시 짜지 않고, 모드에 같이 들어 있는 제작자의 install.ps1 을 그대로 실행한다
-#      설치/업데이트 : install.ps1 -Dir <게임> -From <워크샵 pzopt-classes>   (네트워크 안 씀)
-#      제거          : install.ps1 -Uninstall -Dir <게임>
-#  → 제작자가 설치 방식을 바꿔도 Steam 이 받아온 새 install.ps1 이 쓰이므로 따라갈 필요가 없다.
+#  이 모드는 '구독만으로 안 되는' 수동 설치 모드다: 엔진 class 1천여 개를 게임 폴더에 풀어 넣는다.
+#  창작마당에서 내려가 GitHub 릴리즈(xD3I/PZ_Optimization)로만 배포된다. 릴리즈마다 asset:
+#      pzopt-<게임 리비전>-classes.zip · install.ps1 · uninstall.ps1 (+ Linux 용 .sh)
+#  설치·제거 로직은 우리가 다시 짜지 않고, 그 릴리즈의 제작자 install.ps1 을 그대로 실행한다
+#      설치/업데이트 : install.ps1 -Dir <게임> -Zip <받은 classes.zip>
+#      제거          : install.ps1 -Uninstall -Dir <게임>   (설치 때 게임 폴더 pzopt/uninstall/ 에 남는 사본 우선)
 #
-#  최신 여부 판정 (로컬만 — 네트워크 안 씀)
-#    · 게임 폴더의 pzopt/build-info.properties(설치본) 와 워크샵 사본의 commit·built 비교
-#      → 다르면 '업데이트 필요'. 창작마당의 새 버전은 Steam 이 워크샵 폴더로 받아온 뒤에 반영된다.
-#    · Steam 이 받는 중(appworkshop_108600.acf 의 manifest ≠ latest_manifest)이면 설치·업데이트를 막는다.
-#    · 게임 리비전: 이 모드는 특정 게임 빌드(리비전) 전용이다. 워크샵 사본의 revision 이 게임 jar 의
-#            zombie/GitVersion 리비전과 다르면 설치하지 않는다 (제작자 스크립트도 거부한다).
+#  최신 여부 판정 (GitHub API 조회 1회 — [고급]을 처음 켤 때 백그라운드로)
+#    · 게임 jar 의 zombie/GitVersion 리비전용 zip 이 있는 릴리즈 중 가장 최근 것(초안·프리릴리즈 제외)이 기준
+#    · 태그 끝의 커밋 해시(b42.21-20261102-2253-154126d0 → 154126d0) 와 설치본
+#      pzopt/build-info.properties 의 commit 이 다르면 '업데이트'
+#    · 조회 실패(오프라인·요청 한도)여도 이미 설치된 건 적용 해제할 수 있다
 # ═══════════════════════════════════════════════════════════════════════════════
-PZOPT_WORKSHOP_ID = "3805285544"
-PZOPT_PAGE = "https://steamcommunity.com/sharedfiles/filedetails/?id=" + PZOPT_WORKSHOP_ID
+PZOPT_REPO = "xD3I/PZ_Optimization"
+PZOPT_RELEASES_API = f"https://api.github.com/repos/{PZOPT_REPO}/releases?per_page=50"
+PZOPT_RELEASES_PAGE = f"https://github.com/{PZOPT_REPO}/releases"
+PZOPT_API_TIMEOUT = 10.0     # 릴리즈 목록 조회 한도 (초)
+PZOPT_DL_TIMEOUT = 60.0      # zip 다운로드 소켓 타임아웃 (초)
 
 
 def read_props(p: Path) -> dict:
@@ -1413,30 +1416,6 @@ def jar_revision(game_dir: Path):
         return None
     m = re.search(rb"\b[0-9a-f]{10}\b", data)
     return m.group(0).decode() if m else None
-
-
-def pzopt_mod_root():
-    for root in _steam_roots():
-        for lib in _libraries_from(root):
-            d = lib / "steamapps" / "workshop" / "content" / PZ_APPID / PZOPT_WORKSHOP_ID / "mods" / "PZ_Optimization"
-            if d.is_dir():
-                return d
-    return None
-
-
-def pzopt_copies():
-    """워크샵 안의 빌드들: [(pzopt-classes 폴더, build-info dict)] — built 내림차순."""
-    root = pzopt_mod_root()
-    out = []
-    if root is None:
-        return out
-    for v in root.iterdir():
-        c = v / "pzopt-classes"
-        info = c / "pzopt" / "build-info.properties"
-        if info.is_file() and (c / "pzopt-files.txt").is_file() and (v / "install.ps1").is_file():
-            out.append((c, read_props(info)))
-    out.sort(key=lambda x: int(x[1].get("built", "0") or 0), reverse=True)
-    return out
 
 
 def workshop_item_state(item_id):
@@ -1481,82 +1460,159 @@ def workshop_item_state(item_id):
     return out
 
 
-def pzopt_status(game_dir):
-    """dict: state, installed(props), best(copy, props) 등.
-       state: nomod | mismatch | none | installed | outdated | unfinished"""
+def _pzopt_commit(v):
+    """커밋 해시 비교용 정규화 — 'd1bbdcf-dirty' → 'd1bbdcf'."""
+    return str(v or "").strip().lower().split("-")[0]
+
+
+def pzopt_same_commit(a, b) -> bool:
+    """짧은 해시 길이가 7·8자로 달라질 수 있어 앞부분 일치로 본다."""
+    a, b = _pzopt_commit(a), _pzopt_commit(b)
+    return bool(a and b) and (a.startswith(b) or b.startswith(a))
+
+
+def pzopt_find_release(rev):
+    """GitHub 릴리즈에서 이 게임 리비전용 최신 빌드.
+       반환: {"tag", "commit", "published"(ISO), "zip"(asset), "script"(asset)} 또는 None(이 리비전용 빌드 없음).
+       네트워크·API 오류는 예외로 올린다 (호출 쪽이 '확인 실패'로 표시)."""
+    import urllib.error
+    import urllib.request
+    if not rev:
+        return None
+    req = urllib.request.Request(PZOPT_RELEASES_API, headers={
+        "Accept": "application/vnd.github+json", "User-Agent": "PZOptimizer/" + VERSION})
+    try:
+        with urllib.request.urlopen(req, timeout=PZOPT_API_TIMEOUT) as r:
+            rels = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 429):
+            raise RuntimeError("GitHub 요청 한도 초과 — 잠시 뒤 다시 시도해 주세요.") from e
+        raise RuntimeError(f"GitHub 응답 오류 {e.code}") from e
+    if not isinstance(rels, list):
+        raise RuntimeError("GitHub 릴리즈 목록 형식이 예상과 다름")
+    want = f"pzopt-{rev}-classes.zip"
+    # 목록 순서는 태그 커밋 날짜 기준이라 게시 시각으로 다시 정렬한다 (제작자 install.ps1 과 같은 처리)
+    for rel in sorted(rels, key=lambda x: x.get("published_at") or "", reverse=True):
+        if rel.get("draft") or rel.get("prerelease"):
+            continue
+        assets = {a.get("name"): a for a in rel.get("assets") or []}
+        if want in assets and "install.ps1" in assets:
+            tag = rel.get("tag_name") or ""
+            print(f"[PZOpt] PZ OP release for {rev}: {tag}")
+            return {"tag": tag, "commit": tag.rsplit("-", 1)[-1], "published": rel.get("published_at") or "",
+                    "zip": assets[want], "script": assets["install.ps1"]}
+    print(f"[PZOpt] PZ OP: no release has {want}")
+    return None
+
+
+def pzopt_status(game_dir, rel=None, rel_state="ok"):
+    """로컬 설치 상태 + (조회해 둔) 릴리즈로 상태 판정. 네트워크는 쓰지 않는다.
+       rel_state: ok(조회 완료, rel=None 이면 이 리비전용 빌드 없음) | pending(조회 중) | error(조회 실패)
+       state: unknown | norelease | mismatch | none | installed | outdated | unfinished"""
     gd = Path(game_dir)
     rev = jar_revision(gd)
-    copies = pzopt_copies()
-    match = next(((c, p) for c, p in copies if p.get("revision") == rev), None)
     manifest = gd / "pzopt-installed.txt"
-    inst = read_props(gd / "pzopt" / "build-info.properties") if manifest.is_file() else {}
+    installed = manifest.is_file()
+    inst = read_props(gd / "pzopt" / "build-info.properties") if installed else {}
     unfinished = False
-    if manifest.is_file():
+    if installed:
         try:
             unfinished = "# unfinished" in manifest.read_text(encoding="utf-8", errors="replace")
         except OSError:
             pass
-    if not copies:
-        state = "nomod" if not manifest.is_file() else "installed"
-    elif manifest.is_file():
-        if unfinished:
-            state = "unfinished"
-        elif match and (inst.get("commit") != match[1].get("commit") or inst.get("built") != match[1].get("built")):
+    known = rel_state == "ok"
+    if not known:
+        rel = None
+    if unfinished:
+        state = "unfinished"
+    elif installed:
+        rev_ok = not inst.get("revision") or inst.get("revision") == rev
+        if rel and (not rev_ok or not pzopt_same_commit(inst.get("commit"), rel["commit"])):
             state = "outdated"
-        elif inst.get("revision") and inst.get("revision") != rev:
-            state = "outdated" if match else "mismatch"
+        elif not rev_ok:
+            state = "mismatch"            # 게임이 업데이트됐는데 새 리비전용 빌드가 없거나 아직 확인 못 함
         else:
             state = "installed"
+    elif rel:
+        state = "none"
     else:
-        state = "none" if match else "mismatch"
-    ws = workshop_item_state(PZOPT_WORKSHOP_ID)
-    incomplete = bool(match) and not pzopt_copy_complete(match[0])
-    return {"state": state, "rev": rev, "installed": inst, "match": match, "copies": copies,
-            "ws": ws, "busy": ws["pending"] or incomplete}
+        state = "norelease" if known else "unknown"
+    return {"state": state, "rev": rev, "installed": inst, "release": rel, "rel_state": rel_state}
 
 
-def pzopt_copy_complete(classes_dir: Path) -> bool:
-    """pzopt-files.txt 에 적힌 파일이 워크샵 사본에 전부 있는가 (제작자 스크립트의 Find-WorkshopCopy 와 같은 검사).
-       -From 으로 폴더를 직접 넘기면 스크립트가 이 검사를 건너뛰므로 우리가 먼저 한다."""
-    try:
-        rels = [ln.strip() for ln in (classes_dir / "pzopt-files.txt").read_text(
-            encoding="utf-8", errors="replace").splitlines() if ln.strip()]
-    except OSError:
-        return False
-    return all((classes_dir / r).is_file() for r in rels)
+def _pzopt_download(asset, dest: Path, report=None):
+    """릴리즈 asset 을 dest 로. 크기와(API 가 주면) sha256 digest 로 검증한다."""
+    import urllib.request
+    url = asset.get("browser_download_url") or ""
+    if not _update_url_ok(url):
+        raise ValueError(f"허용되지 않은 다운로드 위치: {url}")
+    req = urllib.request.Request(url, headers={"User-Agent": "PZOptimizer/" + VERSION})
+    h = hashlib.sha256()
+    got = 0
+    total = int(asset.get("size") or 0)
+    name = asset.get("name") or dest.name
+    with urllib.request.urlopen(req, timeout=PZOPT_DL_TIMEOUT) as r:
+        final = getattr(r, "url", None) or url
+        if not _update_url_ok(final):
+            raise ValueError(f"허용되지 않은 다운로드 위치: {final}")
+        last = -1
+        with open(dest, "wb") as f:
+            while True:
+                chunk = r.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                h.update(chunk)
+                got += len(chunk)
+                mb = got // (1024 * 1024)
+                if report and total > 1024 * 1024 and mb != last:
+                    last = mb
+                    report(f"PZ OP 받는 중… {name}  {mb} / {total // (1024 * 1024)} MB")
+    if total and got != total:
+        raise IOError(f"{name} 전송이 중간에 끊겼습니다 ({got}/{total} bytes)")
+    digest = str(asset.get("digest") or "")
+    if digest.lower().startswith("sha256:") and h.hexdigest().lower() != digest[7:].strip().lower():
+        raise IOError(f"{name} 체크섬 불일치 — 다시 시도해 주세요.")
+    print(f"[PZOpt] downloaded {name} ({got} bytes, digest {'checked' if digest else 'not provided'})")
 
 
-def run_pzopt_script(game_dir, uninstall=False):
-    """제작자의 install.ps1 실행. 반환: (성공 여부, 출력 텍스트)."""
+def run_pzopt_script(game_dir, uninstall=False, rel=None, report=None):
+    """제작자의 install.ps1 실행. 설치·업데이트는 rel(pzopt_find_release 결과)의 zip·스크립트를 받아서 쓴다.
+       반환: (성공 여부, 출력 텍스트)."""
     if os.name != "nt":
         raise RuntimeError("PZ OP 적용 스크립트는 Windows 에서만 실행합니다.")
-    st = pzopt_status(game_dir)
-    if uninstall:
-        script = None
-        # 설치 때 게임 폴더에 남는 사본을 우선 — 설치된 빌드와 짝이 맞고, Steam 이 워크샵 폴더를 받는 중이어도 온전하다
-        bundled = Path(game_dir) / "pzopt" / "uninstall" / "install.ps1"
-        if bundled.is_file():
-            script = bundled
-        elif st["copies"] and not st["ws"]["pending"]:
-            script = st["copies"][0][0].parent / "install.ps1"
-        if script is None:
-            raise RuntimeError("제거 스크립트를 찾을 수 없음 — 게임 폴더의 Uninstall-PZ-Optimization.cmd 를 실행해 주세요.")
-        args = ["-Uninstall", "-Dir", str(game_dir)]
-    else:
-        if st["busy"]:
-            raise RuntimeError("Steam 이 PZ OP 업데이트를 받는 중입니다 — 다운로드가 끝난 뒤 다시 시도해 주세요.")
-        if st["match"] is None:
-            raise RuntimeError(f"이 게임 버전(리비전 {st['rev'] or '?'})용 PZ OP 빌드가 워크샵 폴더에 없습니다.\n"
-                               "Steam 이 모드나 게임을 업데이트 중일 수 있습니다 — 잠시 뒤 다시 시도해 주세요.")
-        classes = st["match"][0]
-        script = classes.parent / "install.ps1"
-        args = ["-Dir", str(game_dir), "-From", str(classes)]
     import subprocess
-    cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-           "-File", str(script)] + args
-    r = subprocess.run(cmd, capture_output=True, creationflags=0x08000000, timeout=900)
-    out = (r.stdout or b"").decode("utf-8", "replace") + (r.stderr or b"").decode("utf-8", "replace")
-    return r.returncode == 0, out.strip()
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix="pzopt_"))
+    try:
+        bundled = Path(game_dir) / "pzopt" / "uninstall" / "install.ps1"
+        if uninstall and bundled.is_file():
+            # 설치 때 게임 폴더에 남는 사본 우선 — 설치된 빌드와 짝이 맞고 네트워크가 필요 없다
+            script, args = bundled, ["-Uninstall", "-Dir", str(game_dir)]
+        elif rel is None:
+            raise RuntimeError("GitHub 릴리즈를 확인하지 못했습니다 — 인터넷 연결을 확인하고 다시 시도해 주세요.\n"
+                               + ("또는 게임 폴더의 Uninstall-PZ-Optimization.cmd 를 실행해 주세요." if uninstall else
+                                  PZOPT_RELEASES_PAGE))
+        else:
+            script = tmp / "install.ps1"
+            _pzopt_download(rel["script"], script, report)
+            if uninstall:
+                args = ["-Uninstall", "-Dir", str(game_dir)]
+            else:
+                zip_path = tmp / rel["zip"]["name"]
+                _pzopt_download(rel["zip"], zip_path, report)
+                args = ["-Dir", str(game_dir), "-Zip", str(zip_path)]
+        if report:
+            report("PZ OP 설치 스크립트 실행 중… (1분 정도 걸릴 수 있습니다)")
+        print(f"[PZOpt] run {script.name} {' '.join(args)}")
+        cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+               "-File", str(script)] + args
+        r = subprocess.run(cmd, capture_output=True, creationflags=0x08000000, timeout=900)
+        out = (r.stdout or b"").decode("utf-8", "replace") + (r.stderr or b"").decode("utf-8", "replace")
+        print(f"[PZOpt] install.ps1 exit {r.returncode}")
+        return r.returncode == 0, out.strip()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1814,10 +1870,26 @@ class ProgressTaskWorker(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
+class PzoptReleaseCheck(QObject):
+    """PZ OP 릴리즈 조회를 데몬 스레드에서 — 창을 닫아도 기다리지 않는다 (QThread 는 실행 중 파괴되면 죽음)."""
+    result = pyqtSignal(str, object, str)    # 게임 리비전, 릴리즈(dict|None), 오류 문구("" = 성공)
+
+    def start(self, rev):
+        def run():
+            try:
+                rel, err = pzopt_find_release(rev), ""
+            except Exception as e:
+                rel, err = None, str(e) or type(e).__name__
+                print(f"[PZOpt] PZ OP release check failed: {type(e).__name__}: {e}")
+            self.result.emit(rev or "", rel, err)
+        threading.Thread(target=run, daemon=True).start()
+
+
 class TaskWorker(QThread):
     """임의 함수를 백그라운드에서 실행 (PowerShell 설치 스크립트 등)."""
     done = pyqtSignal(object)
     failed = pyqtSignal(str)
+    progress = pyqtSignal(str)          # 진행 문구 (fn 이 worker.progress.emit 을 받아 쓸 때)
 
     def __init__(self, fn):
         super().__init__()
@@ -1872,6 +1944,10 @@ class OptimizerWindow(QWidget):
         self._rec_all = False          # 권장 세트가 전부 적용된 상태인가 (버튼이 '해제' 로 동작)
         self._adv_want = {}            # 고급 박스 → 고급이 켜졌을 때 보여야 하는가
         self._native_bg_set = False    # 네이티브 배경 브러시는 창 핸들이 생긴 뒤(첫 show) 한 번만 바꾼다
+        # PZ OP GitHub 릴리즈 조회 결과 (게임 리비전별로 한 번). state: idle | pending | ok | error
+        self._po_rel = {"rev": None, "state": "idle", "rel": None, "err": ""}
+        self._po_check = PzoptReleaseCheck()
+        self._po_check.result.connect(self._po_check_done)
         self._build()
         self.setStyleSheet(DARK_QSS)
         self._set_expanded(False)
@@ -2210,6 +2286,8 @@ class OptimizerWindow(QWidget):
         """표시만 바꾼다 — 디스크 상태는 _reload_state 때 이미 읽어 둔 걸 쓴다 (텍스쳐 수천 개 재검사 방지)."""
         self.setUpdatesEnabled(False)        # 창 크기를 맞출 때까지 중간 화면을 그리지 않는다 (_do_fit_height 가 다시 켬)
         self._advanced = on
+        if on and self._po_ensure_check(self.game_dir, retry_error=True):
+            self._po_refresh(self.game_dir)  # '확인 중' 표시
         for box, want in self._adv_want.items():
             box.setVisible(on and want)
         self._fit_height()
@@ -2276,14 +2354,44 @@ class OptimizerWindow(QWidget):
         QMessageBox.information(self, APP_TITLE, f"권장 최적화 {what} 완료\n\n{n}개 항목"
                                 if n else "변경할 항목이 없습니다.")
 
+    def _po_ensure_check(self, gd, force=False, retry_error=False):
+        """[고급]이 켜져 있고 B42 면 이 게임 리비전의 릴리즈 조회를 백그라운드로 시작. 시작했으면 True.
+           force: 성공한 결과도 다시 조회 / retry_error: 실패한 조회만 다시 ([고급]을 다시 켤 때)."""
+        if not self._advanced or gd is None or detect_build(Path(gd)) != "b42":
+            return False
+        rev = jar_revision(Path(gd))
+        cur = self._po_rel
+        if cur["rev"] == rev and (cur["state"] == "pending" or (cur["state"] == "ok" and not force)):
+            return False
+        if cur["rev"] == rev and cur["state"] == "error" and not (force or retry_error):
+            return False                     # 실패는 [다시 확인]·[고급] 다시 켜기 때만 재시도 (요청 한도 보호)
+        self._po_rel = {"rev": rev, "state": "pending", "rel": None, "err": ""}
+        print(f"[PZOpt] checking PZ OP releases for revision {rev}")
+        self._po_check.start(rev)
+        return True
+
+    def _po_check_done(self, rev, rel, err):
+        if rev != (self._po_rel["rev"] or ""):
+            return                           # 그 사이 게임 폴더가 바뀜
+        self._po_rel = {"rev": rev, "state": "error" if err else "ok", "rel": rel, "err": err}
+        if self.worker is None and self.game_dir is not None:
+            self._po_refresh(self.game_dir)
+            self._fit_height()
+
+    def _po_status(self, gd):
+        c = self._po_rel
+        if c["rev"] != jar_revision(Path(gd)):
+            return pzopt_status(gd, None, "pending" if self._advanced else "idle")
+        return pzopt_status(gd, c["rel"], c["state"])
+
     def _po_refresh(self, gd):
         show = gd is not None and detect_build(Path(gd)) == "b42"
         self._adv_show(self.po_box, show)
         if not show:
             return
-        st = pzopt_status(gd)
-        self._po_st = st
-        inst, match = st["installed"], st["match"]
+        self._po_ensure_check(gd)
+        st = self._po_status(gd)
+        inst, rel, rs = st["installed"], st["release"], st["rel_state"]
 
         def ver(p):
             if not p:
@@ -2291,76 +2399,90 @@ class OptimizerWindow(QWidget):
             t = time.strftime("%Y-%m-%d", time.localtime(int(p.get("built", "0") or 0))) if p.get("built") else "?"
             return f"{p.get('commit', '?')} ({t})"
 
-        def ws_ver(p):
-            """워크샵 버전: Steam 에 올라온 시각(acf timeupdated = 창작마당 페이지의 '업데이트' 시각) + 커밋.
-               acf 에 기록이 없으면 빌드 시각(built)으로 대신한다."""
-            if not p:
-                return "?"
-            ts = st["ws"].get("installed_time") or int(p.get("built", "0") or 0)
-            if not ts:
-                return p.get("commit", "?")
-            lt = time.localtime(ts)
-            h = lt.tm_hour % 12 or 12
-            when = f"{lt.tm_year}년 {lt.tm_mon}월 {lt.tm_mday}일 {'오전' if lt.tm_hour < 12 else '오후'} {h}시 {lt.tm_min}분"
-            return f"{when} ({p.get('commit', '?')})"
+        def rel_ver(r):
+            return f"{r['commit']} ({r['published'][:10] or '?'})" if r else "?"
 
         state = st["state"]
         detail = []
+        no_build = (f"게임 리비전 {st['rev'] or '?'} 용 빌드가 GitHub 릴리즈에 없습니다. "
+                    "제작자가 새 게임 버전용 빌드를 올리면 적용할 수 있습니다.")
         if state == "installed":
             self.po_state.setText(f"PZ OP 적용됨  ·  {ver(inst)}")
             self.po_btn.setText("PZ OP 적용 해제")
         elif state == "outdated":
-            self.po_state.setText(f"PZ OP 업데이트 있음  ·  {ver(inst)} → {ver(match[1] if match else None)}")
+            self.po_state.setText(f"PZ OP 업데이트 있음  ·  {ver(inst)} → {rel_ver(rel)}")
             self.po_btn.setText("PZ OP 업데이트")
         elif state == "unfinished":
             self.po_state.setText("PZ OP 적용이 중간에 멈춤")
-            self.po_btn.setText("PZ OP 다시 적용")
+            self.po_btn.setText("PZ OP 다시 적용" if rel else "PZ OP 적용 해제")
         elif state == "mismatch":
             self.po_state.setText("PZ OP — 이 게임 버전용 빌드 없음")
-            self.po_btn.setText("PZ OP 적용 해제" if inst else "PZ OP 적용")
-            detail.append(f"게임 리비전 {st['rev'] or '?'} 용 빌드가 워크샵 폴더에 없습니다. "
-                          "모드 제작자가 새 게임 버전용 빌드를 올리고 Steam 이 받아오면 적용할 수 있습니다.")
-        elif state == "nomod":
-            self.po_state.setText("PZ OP 모드를 구독하지 않음")
+            self.po_btn.setText("PZ OP 적용 해제")
+            if rs == "ok":
+                detail.append(no_build)
+        elif state == "norelease":
+            self.po_state.setText("PZ OP — 이 게임 버전용 빌드 없음")
             self.po_btn.setText("PZ OP 적용")
-            detail.append("창작마당에서 PZ_Optimization 모드를 구독하면 여기서 적용할 수 있습니다.")
+            detail.append(no_build)
+        elif state == "unknown":
+            if rs == "error":
+                self.po_state.setText("PZ OP — GitHub 릴리즈 확인 실패")
+                self.po_btn.setText("다시 확인")
+            else:
+                self.po_state.setText("PZ OP — GitHub 릴리즈 확인 중…")
+                self.po_btn.setText("PZ OP 적용")
         else:
-            self.po_state.setText(f"PZ OP 미적용  ·  워크샵 버전: {ws_ver(match[1] if match else None)}")
+            self.po_state.setText(f"PZ OP 미적용  ·  최신 릴리즈: {rel_ver(rel)}")
             self.po_btn.setText("PZ OP 적용")
+        if state in ("installed", "mismatch", "unfinished"):
+            if rs == "pending":
+                detail.append("GitHub 릴리즈에서 업데이트를 확인하는 중입니다.")
+            elif rs == "error":
+                detail.append("GitHub 릴리즈를 확인하지 못해 업데이트 여부를 알 수 없습니다.")
+        if rs == "error":
+            detail.append(f"사유: {self._po_rel['err']}")
         if state in ("installed", "outdated", "none", "unfinished"):
             detail.append("이 모드의 게임 내 설정이 힙을 바꾸면 위 힙 항목은 비활성화되고 PZ OP 설정을 따릅니다.")
-        if st["busy"]:
-            detail.append("Steam 이 PZ OP 업데이트를 받는 중입니다 — 끝나면 다시 열어 주세요.")
         self.po_detail.setText("\n".join(detail))
         self.po_detail.setVisible(bool(detail))
-        can = (state in ("installed", "outdated", "unfinished", "none")
-               or (state == "mismatch" and bool(inst)))
-        if st["busy"] and state in ("outdated", "unfinished", "none"):
-            can = False                                       # 받는 중인 파일로 설치하지 않는다
+        can = (state in ("installed", "outdated", "none", "unfinished", "mismatch")
+               or (state == "unknown" and rs == "error"))
         self.po_btn.setEnabled(can and self.worker is None)
 
     def _po_click(self):
         gd = self.game_dir
         if gd is None or self.worker is not None:
             return
+        st = self._po_status(gd)
+        state, rel = st["state"], st["release"]
+        if state == "unknown":
+            if st["rel_state"] == "error" and self._po_ensure_check(gd, force=True):
+                self._po_refresh(gd)
+                self._fit_height()
+            return
         if pz_running():
             QMessageBox.information(self, APP_TITLE, "Project Zomboid가 실행 중입니다. 게임을 먼저 종료해 주세요.")
             return
-        st = pzopt_status(gd)
-        uninstall = st["state"] == "installed" or (st["state"] == "mismatch" and st["installed"])
-        what = "적용 해제" if uninstall else ("업데이트" if st["state"] == "outdated" else "적용")
-        if not uninstall and QMessageBox.question(
-                self, APP_TITLE,
-                "PZ OP(PZ_Optimization 모드)는 게임 엔진 class 약 1,100개를 게임 폴더에 넣는 모드입니다.\n"
-                "제작자가 다른 모드·멀티플레이와의 호환을 보장하지 않습니다.\n\n"
-                f"{what}할까요? (모드에 포함된 제작자의 설치 스크립트를 실행합니다)") != QMessageBox.Yes:
-            return
+        uninstall = state in ("installed", "mismatch") or (state == "unfinished" and rel is None)
+        what = "적용 해제" if uninstall else ("업데이트" if state == "outdated" else "적용")
+        if not uninstall:
+            mb = max(1, int(rel["zip"].get("size") or 0) // (1024 * 1024))
+            if QMessageBox.question(
+                    self, APP_TITLE,
+                    "PZ OP(PZ_Optimization 모드)는 게임 엔진 class 1천여 개를 게임 폴더에 넣는 모드입니다.\n"
+                    "제작자가 다른 모드·멀티플레이와의 호환을 보장하지 않습니다.\n\n"
+                    f"{what}할까요?\nGitHub 릴리즈 {rel['tag']} 에서 빌드(약 {mb}MB)와 "
+                    "제작자의 설치 스크립트를 받아 실행합니다.") != QMessageBox.Yes:
+                return
         self._set_busy(True)
         self.prog.setRange(0, 0); self.prog_text.setText(f"PZ OP {what} 중… (1분 정도 걸릴 수 있습니다)")
-        self.worker = TaskWorker(lambda: run_pzopt_script(gd, uninstall=uninstall))
-        self.worker.done.connect(lambda res: self._po_done(what, res))
-        self.worker.failed.connect(self._on_failed)
-        self.worker.start()
+        worker = TaskWorker(None)
+        worker.fn = lambda: run_pzopt_script(gd, uninstall=uninstall, rel=rel, report=worker.progress.emit)
+        worker.progress.connect(self.prog_text.setText)
+        worker.done.connect(lambda res: self._po_done(what, res))
+        worker.failed.connect(self._on_failed)
+        self.worker = worker
+        worker.start()
 
     def _po_done(self, what, res):
         ok, out = res
