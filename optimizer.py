@@ -50,7 +50,7 @@ from PyQt5.QtWidgets import (
 )
 
 
-VERSION = "v2.0.1"
+VERSION = "v2.0.2"
 APP_TITLE = "PZ Optimizer"
 PAGE_TITLE = "프로젝트 좀보이드 최적화 툴"
 
@@ -1310,6 +1310,26 @@ def zb_remove(game_dir):
 # ═══════════════════════════════════════════════════════════════════════════════
 #  UI
 # ═══════════════════════════════════════════════════════════════════════════════
+def set_native_window_bg(hwnd, rgb):
+    """창이 커질 때 Windows 가 Qt 보다 먼저 칠하는 새 영역의 배경 브러시를 바꾼다 (기본은 흰색이라 번쩍임).
+       창 클래스 단위라 같은 클래스의 Qt 창 전부에 적용된다 — 이 앱 창은 모두 다크 테마라 문제없음."""
+    if sys.platform != "win32" or not hwnd:
+        return
+    try:
+        import ctypes
+        r, g, b = rgb
+        gdi32, user32 = ctypes.windll.gdi32, ctypes.windll.user32
+        gdi32.CreateSolidBrush.restype = ctypes.c_void_p
+        gdi32.CreateSolidBrush.argtypes = [ctypes.c_uint32]
+        brush = gdi32.CreateSolidBrush(r | (g << 8) | (b << 16))   # COLORREF = 0x00BBGGRR, 프로세스 끝까지 유지
+        setter = getattr(user32, "SetClassLongPtrW", None) or user32.SetClassLongW   # 32bit 파이썬엔 Ptr 판이 없음
+        setter.restype = ctypes.c_void_p
+        setter.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        setter(ctypes.c_void_p(hwnd), -10, ctypes.c_void_p(brush))  # GCLP_HBRBACKGROUND
+    except Exception as e:
+        print(f"[PZOpt] native background brush failed: {e}")
+
+
 DARK_QSS = """
 QWidget { background:#23252b; color:#e8e8ea; font-family:'Malgun Gothic','맑은 고딕',sans-serif; font-size:13px; }
 QLineEdit { background:#1b1d22; border:1px solid rgba(255,255,255,0.12); border-radius:8px; padding:7px 10px; color:#e8e8ea; }
@@ -1851,6 +1871,7 @@ class OptimizerWindow(QWidget):
         self._advanced = False         # [고급] 토글 — 켜야 개별 항목 박스들이 보인다 (실행할 때마다 꺼진 채 시작)
         self._rec_all = False          # 권장 세트가 전부 적용된 상태인가 (버튼이 '해제' 로 동작)
         self._adv_want = {}            # 고급 박스 → 고급이 켜졌을 때 보여야 하는가
+        self._native_bg_set = False    # 네이티브 배경 브러시는 창 핸들이 생긴 뒤(첫 show) 한 번만 바꾼다
         self._build()
         self.setStyleSheet(DARK_QSS)
         self._set_expanded(False)
@@ -1863,7 +1884,14 @@ class OptimizerWindow(QWidget):
         h.addWidget(w)
         return box
 
+    def showEvent(self, e):
+        super().showEvent(e)
+        if not self._native_bg_set:
+            self._native_bg_set = True
+            set_native_window_bg(int(self.winId()), (0x23, 0x25, 0x2b))   # DARK_QSS 의 QWidget 배경색
+
     def _set_expanded(self, on):
+        self.setUpdatesEnabled(False)        # 창 크기를 맞출 때까지 중간 화면을 그리지 않는다 (_do_fit_height 가 다시 켬)
         self._expanded = on
         self.opt_scroll.setVisible(on)
         i = self._root.indexOf(self.opt_box)
@@ -1878,6 +1906,14 @@ class OptimizerWindow(QWidget):
         QTimer.singleShot(0, self._do_fit_height)
 
     def _do_fit_height(self):
+        try:
+            self._resize_to_content()
+        finally:
+            self.setUpdatesEnabled(True)
+            if self.isVisible():
+                self.repaint()               # 이벤트 루프로 돌아가기 전에 새 크기로 바로 그린다
+
+    def _resize_to_content(self):
         lay = self.layout()
         lay.activate()
         if self._expanded:
@@ -2172,6 +2208,7 @@ class OptimizerWindow(QWidget):
     # --- PZ_Optimization ---
     def _set_advanced(self, on):
         """표시만 바꾼다 — 디스크 상태는 _reload_state 때 이미 읽어 둔 걸 쓴다 (텍스쳐 수천 개 재검사 방지)."""
+        self.setUpdatesEnabled(False)        # 창 크기를 맞출 때까지 중간 화면을 그리지 않는다 (_do_fit_height 가 다시 켬)
         self._advanced = on
         for box, want in self._adv_want.items():
             box.setVisible(on and want)
