@@ -42,15 +42,15 @@ import zipfile
 from collections import namedtuple
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QObject, QThread, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QEvent, QObject, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QLabel, QLineEdit, QPushButton, QVBoxLayout, QHBoxLayout,
+    QApplication, QWidget, QLabel, QLineEdit, QPushButton, QVBoxLayout, QHBoxLayout, QLayout,
     QFileDialog, QFrame, QCheckBox, QMessageBox, QScrollArea, QProgressBar, QDialog, QTextEdit,
 )
 
 
-VERSION = "v2.1.2"
+VERSION = "v2.1.3"
 APP_TITLE = "PZ Optimizer"
 PAGE_TITLE = "프로젝트 좀보이드 최적화 툴"
 
@@ -1407,15 +1407,29 @@ def read_props(p: Path) -> dict:
     return out
 
 
+_JAR_REV_CACHE = {}
+
+
 def jar_revision(game_dir: Path):
-    """게임 jar 의 zombie/GitVersion 리비전 (10자리 hex). 못 읽으면 None."""
+    """게임 jar 의 zombie/GitVersion 리비전 (10자리 hex). 못 읽으면 None.
+       jar 가 커서 열 때마다 수십 ms — 파일 크기·수정 시각이 같으면 이전 결과를 쓴다."""
+    jar = Path(game_dir) / "projectzomboid.jar"
     try:
-        with zipfile.ZipFile(game_dir / "projectzomboid.jar") as z:
+        st = jar.stat()
+    except OSError:
+        return None
+    key = (str(jar), st.st_size, st.st_mtime_ns)
+    if key in _JAR_REV_CACHE:
+        return _JAR_REV_CACHE[key]
+    try:
+        with zipfile.ZipFile(jar) as z:
             data = z.read("zombie/GitVersion.class")
     except (OSError, KeyError, zipfile.BadZipFile):
         return None
     m = re.search(rb"\b[0-9a-f]{10}\b", data)
-    return m.group(0).decode() if m else None
+    rev = m.group(0).decode() if m else None
+    _JAR_REV_CACHE[key] = rev
+    return rev
 
 
 def workshop_item_state(item_id):
@@ -1952,7 +1966,6 @@ class OptimizerWindow(QWidget):
         self.setStyleSheet(DARK_QSS)
         self._set_expanded(False)
         self._reload_state()
-        self._prewarm_hidden()         # 창을 띄우기 전에 — 위 두 줄이 예약한 높이 맞춤이 그 뒤에 돈다
 
     def _indented(self, w, left=22):
         """줄바꿈된 둘째 줄까지 같은 위치에서 시작하도록 공백 대신 여백으로 들여쓴다."""
@@ -1966,32 +1979,10 @@ class OptimizerWindow(QWidget):
         if not self._native_bg_set:
             self._native_bg_set = True
             set_native_window_bg(int(self.winId()), (0x23, 0x25, 0x2b))   # DARK_QSS 의 QWidget 배경색
-
-    def _prewarm_hidden(self):
-        """숨은 [고급] 박스·일반 최적화 목록을 화면 밖에서 한 번 그려 둔다.
-           처음 펼칠 때 글꼴(한글 글리프)·스타일 준비에 수백 ms 가 걸리면, 그동안 창의 늘어난 부분 —
-           특히 직전 창 아래 테두리 자리의 흰 띠(Windows 가 배경 브러시로 칠하지 않음) — 가 그대로 보인다.
-           반드시 창을 띄우기 전에 부를 것: 숨은 위젯의 grab() 은 렌더하는 동안 잠깐 보이는 상태로 쳐서
-           창 레이아웃을 다시 계산해 창을 키우고, 다시 숨겨도 줄이지 않는다. 띄우기 전이면 예약된
-           _do_fit_height 가 그 뒤에 돌아 높이를 바로잡는다."""
-        t0 = time.perf_counter()
-        m = self._root.contentsMargins()
-        w = max(1, self.width() - m.left() - m.right())
-        n = 0
-        for box in list(self._adv_want) + [self.opt_scroll.widget()]:
-            if box is None or box.isVisible():
-                continue
-            try:
-                h = box.heightForWidth(w) if box.hasHeightForWidth() else -1
-                box.resize(w, h if h > 0 else box.sizeHint().height())
-                box.grab()                     # 숨은 채로 렌더 — 보이지 않고 글리프·스타일 캐시만 채운다
-                n += 1
-            except Exception as e:
-                print(f"[PZOpt] prewarm failed: {type(e).__name__}: {e}")
-        print(f"[PZOpt] prewarm {n} hidden boxes in {(time.perf_counter() - t0) * 1000:.0f} ms")
+            self._fit_height()                 # 표시하면서 Qt 가 sizeHint 로 바꾼 높이를 바로잡는다
 
     def _set_expanded(self, on):
-        self.setUpdatesEnabled(False)        # 창 크기를 맞출 때까지 중간 화면을 그리지 않는다 (_do_fit_height 가 다시 켬)
+        self.setUpdatesEnabled(False)        # 창 크기를 맞출 때까지 중간 화면을 그리지 않는다 (_fit_height 가 다시 켬)
         self._expanded = on
         self.opt_scroll.setVisible(on)
         i = self._root.indexOf(self.opt_box)
@@ -2002,18 +1993,21 @@ class OptimizerWindow(QWidget):
         self._fit_height()
 
     def _fit_height(self):
-        """창 높이를 지금 보이는 내용에 맞춘다. 화면보다 크면 화면 높이까지 (넘치는 건 일반 최적화 목록이 스크롤)."""
-        QTimer.singleShot(0, self._do_fit_height)
-
-    def _do_fit_height(self):
+        """창 높이를 지금 보이는 내용에 맞춘다. 화면보다 크면 화면 높이까지 (넘치는 건 일반 최적화 목록이 스크롤).
+           반드시 이벤트 루프로 돌아가기 전에(동기로) 끝낸다. 미루면(QTimer) 그 사이 Qt 레이아웃이 창을
+           최소 높이까지 먼저 한 번 키우고, 우리 크기 조절은 그 뒤에 또 한 번 일어난다 — 첫 번째 확장 때
+           직전 창 아래 테두리 자리가 흰 띠로 드러나고, 그리기를 멈춰 둔 동안 그대로 남았다 (v2.1.2 녹화로 확인)."""
         try:
             self._resize_to_content()
         finally:
             self.setUpdatesEnabled(True)
             if self.isVisible():
-                self.repaint()               # 이벤트 루프로 돌아가기 전에 새 크기로 바로 그린다
+                self.repaint()               # 새 크기로 바로 그린다 (드러난 영역이 비어 보이지 않게)
 
     def _resize_to_content(self):
+        # 박스 안쪽 레이아웃 변경은 LayoutRequest 로 다음 이벤트 루프에 바깥까지 전달된다. 기다리지 않고
+        # 지금 높이를 재므로 밀린 레이아웃 갱신만 여기서 처리한다 (그리기 요청은 처리하지 않음)
+        QApplication.sendPostedEvents(None, QEvent.LayoutRequest)
         lay = self.layout()
         lay.activate()
         if self._expanded:
@@ -2023,12 +2017,17 @@ class OptimizerWindow(QWidget):
             self.opt_scroll.setMinimumHeight(min((hh if hh > 0 else host.sizeHint().height()) + 4, 420))
         else:
             self.opt_scroll.setMinimumHeight(0)
+        QApplication.sendPostedEvents(None, QEvent.LayoutRequest)   # 위 최소 높이 변경도 바로 반영
+        lay.invalidate()
+        lay.activate()
         w = self.width()
         h = lay.totalHeightForWidth(w) if lay.hasHeightForWidth() else lay.totalSizeHint().height()
         sc = self.screen() if hasattr(self, "screen") else None      # Qt 5.14+
         scr = sc.availableGeometry().height() if sc else 1000
+        target = max(360, min(h, scr - 60))
         self.setMinimumHeight(0)
-        self.resize(w, max(360, min(h, scr - 60)))
+        self.resize(w, target)
+        self.setMinimumHeight(target)        # 레이아웃이 최소 높이를 안 잡으므로 사용자가 내용보다 작게 줄이지 못하게
 
     def _opt_summary(self, *_):
         shown = [g for g in OPT_GROUPS if not self.rows[g.key].isHidden() and self.boxes[g.key].isEnabled()]
@@ -2044,6 +2043,10 @@ class OptimizerWindow(QWidget):
 
     def _build(self):
         root = QVBoxLayout(self)
+        # 창 크기는 _fit_height 만 정한다. 기본값(SetDefaultConstraint)이면 박스를 하나 보일 때마다 레이아웃이
+        # 창을 최소 높이까지 그 자리에서 키우고, 줄바꿈 라벨 때문에 그 최소 높이가 실제 필요한 높이보다 커서
+        # 나중에 다시 키우기까지 한다 — [고급] 한 번에 창 크기가 여러 번 바뀌며 흰 띠가 생겼다.
+        root.setSizeConstraint(QLayout.SetNoConstraint)
         root.setContentsMargins(18, 18, 18, 18); root.setSpacing(10)
 
         root.addWidget(self._lbl(PAGE_TITLE, "sect"))
@@ -2308,7 +2311,7 @@ class OptimizerWindow(QWidget):
     # --- PZ_Optimization ---
     def _set_advanced(self, on):
         """표시만 바꾼다 — 디스크 상태는 _reload_state 때 이미 읽어 둔 걸 쓴다 (텍스쳐 수천 개 재검사 방지)."""
-        self.setUpdatesEnabled(False)        # 창 크기를 맞출 때까지 중간 화면을 그리지 않는다 (_do_fit_height 가 다시 켬)
+        self.setUpdatesEnabled(False)        # 창 크기를 맞출 때까지 중간 화면을 그리지 않는다 (_fit_height 가 다시 켬)
         self._advanced = on
         if on and self._po_ensure_check(self.game_dir, retry_error=True):
             self._po_refresh(self.game_dir)  # '확인 중' 표시
