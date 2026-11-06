@@ -50,7 +50,7 @@ from PyQt5.QtWidgets import (
 )
 
 
-VERSION = "v2.1.1"
+VERSION = "v2.1.2"
 APP_TITLE = "PZ Optimizer"
 PAGE_TITLE = "프로젝트 좀보이드 최적화 툴"
 
@@ -1952,6 +1952,7 @@ class OptimizerWindow(QWidget):
         self.setStyleSheet(DARK_QSS)
         self._set_expanded(False)
         self._reload_state()
+        self._prewarm_hidden()         # 창을 띄우기 전에 — 위 두 줄이 예약한 높이 맞춤이 그 뒤에 돈다
 
     def _indented(self, w, left=22):
         """줄바꿈된 둘째 줄까지 같은 위치에서 시작하도록 공백 대신 여백으로 들여쓴다."""
@@ -1965,12 +1966,14 @@ class OptimizerWindow(QWidget):
         if not self._native_bg_set:
             self._native_bg_set = True
             set_native_window_bg(int(self.winId()), (0x23, 0x25, 0x2b))   # DARK_QSS 의 QWidget 배경색
-            QTimer.singleShot(0, self._prewarm_hidden)
 
     def _prewarm_hidden(self):
         """숨은 [고급] 박스·일반 최적화 목록을 화면 밖에서 한 번 그려 둔다.
            처음 펼칠 때 글꼴(한글 글리프)·스타일 준비에 수백 ms 가 걸리면, 그동안 창의 늘어난 부분 —
-           특히 직전 창 아래 테두리 자리의 흰 띠(Windows 가 배경 브러시로 칠하지 않음) — 가 그대로 보인다."""
+           특히 직전 창 아래 테두리 자리의 흰 띠(Windows 가 배경 브러시로 칠하지 않음) — 가 그대로 보인다.
+           반드시 창을 띄우기 전에 부를 것: 숨은 위젯의 grab() 은 렌더하는 동안 잠깐 보이는 상태로 쳐서
+           창 레이아웃을 다시 계산해 창을 키우고, 다시 숨겨도 줄이지 않는다. 띄우기 전이면 예약된
+           _do_fit_height 가 그 뒤에 돌아 높이를 바로잡는다."""
         t0 = time.perf_counter()
         m = self._root.contentsMargins()
         w = max(1, self.width() - m.left() - m.right())
