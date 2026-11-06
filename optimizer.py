@@ -50,7 +50,7 @@ from PyQt5.QtWidgets import (
 )
 
 
-VERSION = "v2.1.0"
+VERSION = "v2.1.1"
 APP_TITLE = "PZ Optimizer"
 PAGE_TITLE = "프로젝트 좀보이드 최적화 툴"
 
@@ -1965,6 +1965,27 @@ class OptimizerWindow(QWidget):
         if not self._native_bg_set:
             self._native_bg_set = True
             set_native_window_bg(int(self.winId()), (0x23, 0x25, 0x2b))   # DARK_QSS 의 QWidget 배경색
+            QTimer.singleShot(0, self._prewarm_hidden)
+
+    def _prewarm_hidden(self):
+        """숨은 [고급] 박스·일반 최적화 목록을 화면 밖에서 한 번 그려 둔다.
+           처음 펼칠 때 글꼴(한글 글리프)·스타일 준비에 수백 ms 가 걸리면, 그동안 창의 늘어난 부분 —
+           특히 직전 창 아래 테두리 자리의 흰 띠(Windows 가 배경 브러시로 칠하지 않음) — 가 그대로 보인다."""
+        t0 = time.perf_counter()
+        m = self._root.contentsMargins()
+        w = max(1, self.width() - m.left() - m.right())
+        n = 0
+        for box in list(self._adv_want) + [self.opt_scroll.widget()]:
+            if box is None or box.isVisible():
+                continue
+            try:
+                h = box.heightForWidth(w) if box.hasHeightForWidth() else -1
+                box.resize(w, h if h > 0 else box.sizeHint().height())
+                box.grab()                     # 숨은 채로 렌더 — 보이지 않고 글리프·스타일 캐시만 채운다
+                n += 1
+            except Exception as e:
+                print(f"[PZOpt] prewarm failed: {type(e).__name__}: {e}")
+        print(f"[PZOpt] prewarm {n} hidden boxes in {(time.perf_counter() - t0) * 1000:.0f} ms")
 
     def _set_expanded(self, on):
         self.setUpdatesEnabled(False)        # 창 크기를 맞출 때까지 중간 화면을 그리지 않는다 (_do_fit_height 가 다시 켬)
