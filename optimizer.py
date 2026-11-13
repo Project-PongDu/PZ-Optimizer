@@ -50,7 +50,7 @@ from PyQt5.QtWidgets import (
 )
 
 
-VERSION = "v2.1.7"
+VERSION = "v2.2.0"
 APP_TITLE = "PZ Optimizer"
 PAGE_TITLE = "프로젝트 좀보이드 최적화 툴"
 
@@ -963,6 +963,10 @@ def _is_zb_opt(tok, arg) -> bool:
     return tok == arg or tok.startswith(arg + "=")
 
 
+STEAM_RUNNING_MSG = ("Steam 이 실행 중입니다 — 실행 옵션은 Steam 이 꺼져 있을 때만 바꿀 수 있습니다.\n"
+                     "트레이의 Steam 아이콘 우클릭 → [나가기] 로 완전히 종료한 뒤 다시 눌러 주세요.")
+
+
 def steam_running() -> bool:
     if os.name != "nt":
         return False
@@ -1087,24 +1091,46 @@ def vdf_set_launch_options(text, new_opts):
     return text[:ls] + block + text[ls:]
 
 
+STEAM_COMMAND_TOKEN = "%command%"
+
+
+def launch_split(opts):
+    """Steam 실행 옵션을 (래퍼, 게임 인자) 로 나눈다.
+       '%command%' 가 있으면 그 토큰까지가 래퍼(예: PZ OP 의 conhost … pzopt-launch.cmd %command%)이고
+       뒤는 Steam 이 게임 exe 에 붙이는 인자다. 없으면 전부 게임 인자."""
+    opts = opts or ""
+    i = opts.lower().find(STEAM_COMMAND_TOKEN)
+    if i < 0:
+        return "", opts.strip()
+    j = i + len(STEAM_COMMAND_TOKEN)
+    return opts[:j].strip(), opts[j:].strip()
+
+
+def launch_join(head, args):
+    return " ".join(x for x in (head, args) if x)
+
+
 def launch_opts_add(opts, arg):
-    """'-agentlib:zbNative' 를 JVM 인자 구역(-- 앞)에 넣는다. 이미 있으면 그대로."""
-    toks = opts.split()
+    """'-agentlib:zbNative' 를 JVM 인자 구역(-- 앞)에 넣는다. 이미 있으면 그대로.
+       %command% 래퍼가 있으면 래퍼는 그대로 두고 그 뒤 게임 인자 쪽에 넣는다."""
+    head, rest = launch_split(opts)
+    toks = rest.split()
     if any(_is_zb_opt(t, arg) for t in toks):
         return opts, False
     if "--" in toks:
-        return " ".join([arg] + toks), True
-    return " ".join([arg, "--"] + toks), True      # -- 가 없으면 기존 것은 전부 게임 인자
+        return launch_join(head, " ".join([arg] + toks)), True
+    return launch_join(head, " ".join([arg, "--"] + toks)), True   # -- 가 없으면 기존 것은 전부 게임 인자
 
 
 def launch_opts_remove(opts, arg):
-    toks = opts.split()
+    head, rest = launch_split(opts)
+    toks = rest.split()
     kept = [t for t in toks if not _is_zb_opt(t, arg)]
     if len(kept) == len(toks):
         return opts, False
     if kept and kept[0] == "--":                     # 우리가 붙인 '--' 만 남았으면 같이 제거
         kept = kept[1:]
-    return " ".join(kept), True
+    return launch_join(head, " ".join(kept)), True
 
 
 def _steam_localconfigs():
@@ -1231,8 +1257,7 @@ def zb_apply(game_dir):
     arg = spec["launch_arg"]
     use_steam = is_steam_install(gd) and bool(_steam_localconfigs())
     if use_steam and steam_running():
-        raise RuntimeError("Steam 이 실행 중입니다 — 실행 옵션은 Steam 이 꺼져 있을 때만 바꿀 수 있습니다.\n"
-                           "트레이의 Steam 아이콘 우클릭 → [나가기] 로 완전히 종료한 뒤 다시 눌러 주세요.")
+        raise RuntimeError(STEAM_RUNNING_MSG)
     done = []
     for f in spec["core_files"]:
         src = mod / "libs" / f
@@ -1273,8 +1298,7 @@ def zb_remove(game_dir):
     if use_steam and steam_running():
         st = _steam_opts_state(arg)
         if any(o and any(_is_zb_opt(t, arg) for t in o.split()) for _, o in st):
-            raise RuntimeError("Steam 이 실행 중입니다 — 실행 옵션은 Steam 이 꺼져 있을 때만 바꿀 수 있습니다.\n"
-                               "트레이의 Steam 아이콘 우클릭 → [나가기] 로 완전히 종료한 뒤 다시 눌러 주세요.")
+            raise RuntimeError(STEAM_RUNNING_MSG)
     done = []
     changed = []
     _edit_json_vmargs(gd, lambda a: (changed.append(1) or [x for x in a if not _is_zb_opt(x, arg)])
@@ -1386,8 +1410,21 @@ QProgressBar::chunk { background:#1d9e75; border-radius:4px; }
 #    · 태그 끝의 커밋 해시(b42.21-20261102-2253-154126d0 → 154126d0) 와 설치본
 #      pzopt/build-info.properties 의 commit 이 다르면 '업데이트'
 #    · 조회 실패(오프라인·요청 한도)여도 이미 설치된 건 적용 해제할 수 있다
+#
+#  42.22 부터 (서명된 projectzomboid.jar)
+#    · 게임 폴더에 class 를 풀어 두는 것만으로는 안 먹어서, install.ps1 이 json vmArgs 에
+#      -javaagent:pzopt/agent/pzopt-agent.jar 를 넣고 게임 폴더에 pzopt-launch.cmd 를 둔다.
+#    · Steam 이 게임 폴더에서 ProjectZomboid64.exe 를 바로 띄우면 에이전트의 instrument.dll 이
+#      jre64\bin 의 java.dll·jli.dll 을 못 찾아 게임이 바로 꺼진다 → Steam 실행 옵션을
+#          "<SystemRoot>\System32\conhost.exe" --headless "<게임>\pzopt-launch.cmd" %command% [기존 옵션]
+#      로 바꿔야 한다. install.ps1 은 이 줄을 클립보드에 넣고 '직접 붙여 넣으라'고만 하므로
+#      (창 없이 돌리는 우리 쪽에선 사용자가 그 안내를 못 본다) 우리가 localconfig.vdf 에 직접 넣는다.
+#    · Steam 은 실행 중에 localconfig.vdf 를 자기 값으로 다시 쓰므로, 바꿀 게 있으면 Steam 을 끈 상태여야 한다.
+#    · 제거하면 pzopt-launch.cmd 도 지워져 그 줄이 남아 있으면 Steam 이 게임을 못 켠다 → 제거 때 같이 뺀다.
+#      게임 안 [Uninstall] 로 지운 경우처럼 줄만 남은 상태도 감지해서 정리 버튼을 띄운다.
 # ═══════════════════════════════════════════════════════════════════════════════
 PZOPT_REPO = "xD3I/PZ_Optimization"
+PZOPT_LAUNCH_CMD = "pzopt-launch.cmd"      # 42.22+ 릴리즈 zip 에 들어 있는 Steam 실행 옵션용 래퍼
 PZOPT_RELEASES_API = f"https://api.github.com/repos/{PZOPT_REPO}/releases?per_page=50"
 PZOPT_RELEASES_PAGE = f"https://github.com/{PZOPT_REPO}/releases"
 PZOPT_API_TIMEOUT = 10.0     # 릴리즈 목록 조회 한도 (초)
@@ -1430,6 +1467,28 @@ def jar_revision(game_dir: Path):
     rev = m.group(0).decode() if m else None
     _JAR_REV_CACHE[key] = rev
     return rev
+
+
+_JAR_SIGNED_CACHE = {}
+
+
+def jar_signed(game_dir) -> bool:
+    """projectzomboid.jar 가 서명돼 있는가 (42.22 부터). 서명 jar 면 PZ OP 는 에이전트 + Steam 실행 옵션이 필요하다."""
+    jar = Path(game_dir) / "projectzomboid.jar"
+    try:
+        st = jar.stat()
+    except OSError:
+        return False
+    key = (str(jar), st.st_size, st.st_mtime_ns)
+    if key not in _JAR_SIGNED_CACHE:
+        try:
+            with zipfile.ZipFile(jar) as z:
+                names = z.namelist()
+        except (OSError, zipfile.BadZipFile):
+            return False
+        _JAR_SIGNED_CACHE[key] = any(n.upper().startswith("META-INF/") and n.upper().endswith((".SF", ".RSA", ".EC", ".DSA"))
+                                     for n in names)
+    return _JAR_SIGNED_CACHE[key]
 
 
 def workshop_item_state(item_id):
@@ -1519,6 +1578,87 @@ def pzopt_find_release(rev):
     return None
 
 
+def pzopt_launch_line(game_dir) -> str:
+    """install.ps1 의 Show-LaunchOption 과 같은 줄."""
+    sysroot = os.environ.get("SystemRoot") or r"C:\Windows"
+    conhost = os.path.join(sysroot, "System32", "conhost.exe")
+    cmd = os.path.join(str(game_dir), PZOPT_LAUNCH_CMD)
+    return f'"{conhost}" --headless "{cmd}" {STEAM_COMMAND_TOKEN}'
+
+
+def _is_pzopt_head(head) -> bool:
+    return PZOPT_LAUNCH_CMD in (head or "").lower()
+
+
+def _pzopt_launch_plan(game_dir, on):
+    """Steam 실행 옵션을 PZ OP 래퍼 켬(on)/끔 상태로 맞추려면 바꿀 것. 쓰지는 않는다.
+       반환: ([(localconfig 경로, 새 옵션)], [다른 래퍼가 있어 건너뛴 경로])"""
+    line = pzopt_launch_line(game_dir)
+    changes, foreign = [], []
+    for p in _steam_localconfigs():
+        try:
+            cur, _ = vdf_get_launch_options(p.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+        head, rest = launch_split(cur or "")
+        if on:
+            if head.lower() == line.lower():
+                continue
+            if head and not _is_pzopt_head(head):
+                foreign.append(p)               # 다른 %command% 래퍼 — 겹쳐 넣으면 어떻게 될지 몰라 손대지 않음
+                continue
+            changes.append((p, launch_join(line, rest)))
+        elif _is_pzopt_head(head):
+            changes.append((p, rest))
+    return changes, foreign
+
+
+def pzopt_launch_state(game_dir) -> str:
+    """Steam 실행 옵션의 PZ OP 래퍼 상태 (B42.22+ 서명 jar 용).
+       na: 필요 없고 남아 있지도 않음 | ok: 맞게 들어 있음 | missing: 필요한데 없음(게임이 바로 꺼짐)
+       foreign: 다른 %command% 래퍼가 있어 자동으로 못 넣음 | stale: 래퍼 파일은 없는데 줄만 남음(게임이 안 켜짐)
+       manual: Steam 정식 설치본이 아니라 실행 옵션을 건드리지 않음 (필요하면 직접)"""
+    gd = Path(game_dir)
+    need = (gd / PZOPT_LAUNCH_CMD).is_file()
+    if not (is_steam_install(gd) and _steam_localconfigs()):
+        return "manual" if need else "na"
+    changes, foreign = _pzopt_launch_plan(gd, need)
+    if need:
+        if not changes and not foreign:
+            return "ok"
+        if foreign and not changes:
+            return "foreign"
+        return "missing"
+    return "stale" if changes else "na"
+
+
+def pzopt_launch_apply(game_dir, on):
+    """Steam 실행 옵션에 PZ OP 래퍼를 넣거나(on) 뺀다. 반환: 바뀐 항목 설명 리스트.
+       바꿀 게 있는데 Steam 이 켜져 있으면 RuntimeError (Steam 이 값을 되돌려 씀)."""
+    gd = Path(game_dir)
+    if not (is_steam_install(gd) and _steam_localconfigs()):
+        return []
+    changes, foreign = _pzopt_launch_plan(gd, on)
+    if changes and steam_running():
+        raise RuntimeError(STEAM_RUNNING_MSG)
+    done = []
+    for p, _ in changes:
+        text = p.read_text(encoding="utf-8", errors="replace")
+        cur, _ = vdf_get_launch_options(text)
+        head, rest = launch_split(cur or "")
+        new = launch_join(pzopt_launch_line(gd), rest) if on else rest
+        if new == (cur or ""):
+            continue
+        _backup_localconfig(p)
+        p.write_text(vdf_set_launch_options(text, new), encoding="utf-8")
+        print(f"[PZOpt] steam launch options ({p.parent.parent.name}): {new!r}")
+        done.append(f"Steam 실행 옵션 ({p.parent.parent.name}): {new or '(비움)'}")
+    for p in foreign:
+        print(f"[PZOpt] steam launch options ({p.parent.parent.name}) has another %command% wrapper, left as is")
+        done.append(f"Steam 실행 옵션 ({p.parent.parent.name}): 다른 %command% 래퍼가 있어 그대로 둠 — 직접 맞춰 주세요")
+    return done
+
+
 def pzopt_status(game_dir, rel=None, rel_state="ok"):
     """로컬 설치 상태 + (조회해 둔) 릴리즈로 상태 판정. 네트워크는 쓰지 않는다.
        rel_state: ok(조회 완료, rel=None 이면 이 리비전용 빌드 없음) | pending(조회 중) | error(조회 실패)
@@ -1551,7 +1691,8 @@ def pzopt_status(game_dir, rel=None, rel_state="ok"):
         state = "none"
     else:
         state = "norelease" if known else "unknown"
-    return {"state": state, "rev": rev, "installed": inst, "release": rel, "rel_state": rel_state}
+    return {"state": state, "rev": rev, "installed": inst, "release": rel, "rel_state": rel_state,
+            "launch": pzopt_launch_state(gd)}
 
 
 def _pzopt_download(asset, dest: Path, report=None):
@@ -1590,8 +1731,20 @@ def _pzopt_download(asset, dest: Path, report=None):
     print(f"[PZOpt] downloaded {name} ({got} bytes, digest {'checked' if digest else 'not provided'})")
 
 
+def _pzopt_trim_launch_notes(out):
+    """우리가 Steam 실행 옵션을 직접 맞췄을 때 install.ps1 의 '직접 붙여 넣으라' 안내를 뺀다."""
+    lines = out.splitlines()
+    for i, ln in enumerate(lines):
+        if ln.startswith("ONE MORE STEP"):           # 설치: 이 줄부터 끝까지가 붙여 넣기 안내
+            return "\n".join(lines[:i]).rstrip()
+    return "\n".join(ln for ln in lines                  # 제거: 실행 옵션을 비우라는 2줄
+                     if not ln.startswith("If you set the Steam launch option")
+                     and not ln.startswith("General > Launch Options)")).rstrip()
+
+
 def run_pzopt_script(game_dir, uninstall=False, rel=None, report=None):
     """제작자의 install.ps1 실행. 설치·업데이트는 rel(pzopt_find_release 결과)의 zip·스크립트를 받아서 쓴다.
+       42.22+ 빌드(zip 에 pzopt-launch.cmd 있음)는 Steam 실행 옵션도 맞춘다 (제거 때는 뺀다).
        반환: (성공 여부, 출력 텍스트)."""
     if os.name != "nt":
         raise RuntimeError("PZ OP 적용 스크립트는 Windows 에서만 실행합니다.")
@@ -1616,6 +1769,16 @@ def run_pzopt_script(game_dir, uninstall=False, rel=None, report=None):
                 zip_path = tmp / rel["zip"]["name"]
                 _pzopt_download(rel["zip"], zip_path, report)
                 args = ["-Dir", str(game_dir), "-Zip", str(zip_path)]
+        launch_on = False
+        if not uninstall:
+            with zipfile.ZipFile(zip_path) as z:
+                launch_on = PZOPT_LAUNCH_CMD in z.namelist()
+        steam_ok = is_steam_install(game_dir) and bool(_steam_localconfigs())
+        # Steam 이 켜져 있으면 실행 옵션을 못 바꾼다 — 설치부터 해 버리면 게임이 안 켜지는 상태로 남으니 먼저 막는다
+        if steam_ok and _pzopt_launch_plan(game_dir, launch_on)[0] and steam_running():
+            raise RuntimeError(STEAM_RUNNING_MSG + "\n\n(" + ("PZ OP 42.22+ 빌드는 Steam 실행 옵션을 바꿔야 게임이 켜집니다."
+                                                       if launch_on else
+                                                       "Steam 실행 옵션에 남은 PZ OP 실행 줄을 빼야 게임이 켜집니다.") + ")")
         if report:
             report("PZ OP 설치 스크립트 실행 중… (1분 정도 걸릴 수 있습니다)")
         print(f"[PZOpt] run {script.name} {' '.join(args)}")
@@ -1624,7 +1787,24 @@ def run_pzopt_script(game_dir, uninstall=False, rel=None, report=None):
         r = subprocess.run(cmd, capture_output=True, creationflags=0x08000000, timeout=900)
         out = (r.stdout or b"").decode("utf-8", "replace") + (r.stderr or b"").decode("utf-8", "replace")
         print(f"[PZOpt] install.ps1 exit {r.returncode}")
-        return r.returncode == 0, out.strip()
+        out = out.strip()
+        if r.returncode != 0:
+            return False, out
+        notes = []
+        if steam_ok:
+            try:
+                notes = pzopt_launch_apply(game_dir, launch_on)
+                out = _pzopt_trim_launch_notes(out)
+            except RuntimeError as e:
+                print(f"[PZOpt] steam launch options not changed: {e}")
+                notes = ["⚠ Steam 실행 옵션을 바꾸지 못했습니다 — Steam 을 완전히 종료한 뒤 "
+                         "PZ OP 박스의 버튼으로 다시 맞춰 주세요."]
+        elif launch_on:
+            notes = ["⚠ 이 폴더는 Steam 정식 설치본이 아니라 Steam 실행 옵션을 건드리지 않았습니다.",
+                     "Steam 으로 이 폴더를 실행한다면 실행 옵션에 직접 넣어 주세요:", pzopt_launch_line(game_dir)]
+        if notes:
+            out = out + "\n\n" + "\n".join(notes)
+        return True, out
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -2472,6 +2652,7 @@ class OptimizerWindow(QWidget):
             return f"{r['commit']} ({r['published'][:10] or '?'})" if r else "?"
 
         state = st["state"]
+        launch = st["launch"]
         detail = []
         no_build = (f"게임 리비전 {st['rev'] or '?'} 용 빌드가 GitHub 릴리즈에 없습니다. "
                     "제작자가 새 게임 버전용 빌드를 올리면 적용할 수 있습니다.")
@@ -2503,6 +2684,21 @@ class OptimizerWindow(QWidget):
         else:
             self.po_state.setText(f"PZ OP 미적용  ·  최신 릴리즈: {rel_ver(rel)}")
             self.po_btn.setText("PZ OP 적용")
+        fix = self._po_launch_fix(st)
+        if fix == "set":
+            self.po_state.setText(f"PZ OP 적용됨 — Steam 실행 옵션 없음  ·  {ver(inst)}")
+            self.po_btn.setText("Steam 실행 옵션 설정")
+            detail.append("42.22 부터는 Steam 실행 옵션으로 pzopt-launch.cmd 를 거쳐야 게임이 켜집니다. "
+                          "지금 상태로 Steam 에서 실행하면 게임이 바로 꺼집니다.")
+        elif fix == "clear":
+            self.po_btn.setText("Steam 실행 옵션 정리")
+            detail.append("PZ OP 가 지워졌는데 Steam 실행 옵션에 pzopt-launch.cmd 줄이 남아 있어 게임이 켜지지 않습니다.")
+        if launch == "foreign":
+            detail.append("Steam 실행 옵션에 다른 %command% 실행기가 있어 자동으로 넣지 않았습니다. 직접 맞춰 주세요:\n"
+                          + pzopt_launch_line(gd))
+        elif launch == "manual":
+            detail.append("Steam 정식 설치본이 아니라 실행 옵션을 건드리지 않습니다. Steam 으로 실행한다면 직접 넣어 주세요:\n"
+                          + pzopt_launch_line(gd))
         if state in ("installed", "mismatch", "unfinished"):
             if rs == "pending":
                 detail.append("GitHub 릴리즈에서 업데이트를 확인하는 중입니다.")
@@ -2515,8 +2711,17 @@ class OptimizerWindow(QWidget):
         self.po_detail.setText("\n".join(detail))
         self.po_detail.setVisible(bool(detail))
         can = (state in ("installed", "outdated", "none", "unfinished", "mismatch")
-               or (state == "unknown" and rs == "error"))
+               or (state == "unknown" and rs == "error") or fix is not None)
         self.po_btn.setEnabled(can and self.worker is None)
+
+    @staticmethod
+    def _po_launch_fix(st):
+        """버튼이 Steam 실행 옵션만 고치는 경우: 'set' | 'clear' | None"""
+        if st["launch"] == "missing" and st["state"] == "installed":
+            return "set"                     # 설치는 됐는데 실행 옵션이 없음 (v2.1.x 로 설치·Steam 이 되돌림 등)
+        if st["launch"] == "stale" and st["state"] in ("none", "norelease", "unknown"):
+            return "clear"                   # 게임 안 [Uninstall] 등으로 지워졌는데 줄만 남음
+        return None
 
     def _po_click(self):
         gd = self.game_dir
@@ -2524,6 +2729,20 @@ class OptimizerWindow(QWidget):
             return
         st = self._po_status(gd)
         state, rel = st["state"], st["release"]
+        fix = self._po_launch_fix(st)
+        if fix is not None:
+            try:
+                done = pzopt_launch_apply(gd, fix == "set")
+            except RuntimeError as e:
+                QMessageBox.information(self, APP_TITLE, str(e))
+                return
+            except Exception as e:
+                QMessageBox.warning(self, APP_TITLE, f"실패: {e}")
+                return
+            self._reload_state()
+            QMessageBox.information(self, APP_TITLE, "Steam 실행 옵션 " + ("설정" if fix == "set" else "정리")
+                                    + " 완료\n\n" + ("\n".join(done) or "바꿀 것이 없습니다."))
+            return
         if state == "unknown":
             if st["rel_state"] == "error" and self._po_ensure_check(gd, force=True):
                 self._po_refresh(gd)
@@ -2534,12 +2753,21 @@ class OptimizerWindow(QWidget):
             return
         uninstall = state in ("installed", "mismatch") or (state == "unfinished" and rel is None)
         what = "적용 해제" if uninstall else ("업데이트" if state == "outdated" else "적용")
+        # 실행 옵션을 바꿔야 하는데 Steam 이 켜져 있으면 받기 전에 막는다 (run_pzopt_script 에도 같은 검사가 있음)
+        launch_change = (st["launch"] in ("ok", "stale") if uninstall
+                         else st["launch"] not in ("ok", "foreign", "manual") and jar_signed(gd))
+        if launch_change and is_steam_install(gd) and steam_running():
+            QMessageBox.information(self, APP_TITLE, STEAM_RUNNING_MSG + "\n\n(PZ OP " + what +
+                                    " 때 Steam 실행 옵션도 함께 바꿔야 게임이 켜집니다.)")
+            return
         if not uninstall:
             mb = max(1, int(rel["zip"].get("size") or 0) // (1024 * 1024))
             if QMessageBox.question(
                     self, APP_TITLE,
                     "PZ OP(PZ_Optimization 모드)는 게임 엔진 class 1천여 개를 게임 폴더에 넣는 모드입니다.\n"
-                    "제작자가 다른 모드·멀티플레이와의 호환을 보장하지 않습니다.\n\n"
+                    "제작자가 다른 모드·멀티플레이와의 호환을 보장하지 않습니다.\n"
+                    + ("42.22 부터는 Steam 실행 옵션도 함께 바꿉니다 (pzopt-launch.cmd 를 거쳐 실행).\n"
+                       if jar_signed(gd) else "") + "\n"
                     f"{what}할까요?\nGitHub 릴리즈 {rel['tag']} 에서 빌드(약 {mb}MB)와 "
                     "제작자의 설치 스크립트를 받아 실행합니다.") != QMessageBox.Yes:
                 return
